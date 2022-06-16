@@ -6,7 +6,14 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+anyhow = "1.0.57"
 clap = { version = "3.2.2", features = ["derive"] }
+miette = { version = "4.7.1", features = ["fancy"] }
+nom = "7.1.1"
+nom-supreme = "0.8.0"
+nom_locate = "4.0.0"
+pori = "0.0.0"
+thiserror = "1.0.31"
 tree-sitter = "0.20.6"
 
 [build-dependencies]

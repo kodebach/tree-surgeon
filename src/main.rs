@@ -1,10 +1,18 @@
 use std::{
+    collections::HashMap,
     fs,
-    io::{self, BufRead, Read},
+    io::{self, Read},
+    str::Utf8Error,
 };
 
 use clap::Parser;
-use tree_sitter::{Language, Parser as TreeParser, Query, QueryCursor};
+use miette::IntoDiagnostic;
+use thiserror::Error;
+use tree_sitter::{Language, Parser as TreeParser, QueryCursor};
+use tree_surgeon::{
+    dsl::ast::ScriptParser,
+    single::{self, Single},
+};
 
 extern "C" {
     fn tree_sitter_c() -> Language;
@@ -20,49 +28,83 @@ struct Cli {
     script_file: Option<String>,
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> miette::Result<()> {
     let cli = Cli::parse();
 
     let mut parser = TreeParser::new();
     let language = unsafe { tree_sitter_c() };
-    parser.set_language(language)?;
+    parser.set_language(language).into_diagnostic()?;
 
-    let source_text = fs::read(cli.source_file)?;
+    let source_text = fs::read(cli.source_file).into_diagnostic()?;
 
     let tree = parser
         .parse(&source_text, Option::None)
-        .ok_or(io::Error::new(io::ErrorKind::Other, "Parsing failed"))?;
+        .ok_or(io::Error::new(io::ErrorKind::Other, "Parsing failed"))
+        .into_diagnostic()?;
 
-    let mut script;
+    let script_source = if let Some(script_file) = cli.script_file {
+        let script_buf = fs::read(&script_file).into_diagnostic()?;
 
-    if let Some(script_file) = cli.script_file {
-        let script_buf = fs::read(script_file)?;
-        script = String::from_utf8(script_buf)?;
+        String::from_utf8(script_buf).into_diagnostic()?
     } else {
         let stdin = io::stdin();
-        script = String::new();
-        stdin.lock().read_to_string(&mut script)?;
+        let mut source = String::new();
+        stdin.lock().read_to_string(&mut source).into_diagnostic()?;
+
+        source
+    };
+
+    let parser = ScriptParser::new(script_source);
+    let script = parser.parse(language).map_err(|e| e.into_owned())?;
+
+    for statement in script.statements() {
+        match statement {
+            tree_surgeon::dsl::ast::Statement::Match(m) => {
+                let query = m.query();
+                let mut cursor = QueryCursor::new();
+                let matches = cursor.matches(&query, tree.root_node(), source_text.as_slice());
+
+                let capture_indices: HashMap<_, _> = query
+                    .capture_names()
+                    .iter()
+                    .filter_map(|name| {
+                        query
+                            .capture_index_for_name(name)
+                            .map(|index| (name, index))
+                    })
+                    .collect();
+
+                #[derive(Debug, Error)]
+                enum Err {
+                    #[error(transparent)]
+                    Single(single::Error),
+                    #[error(transparent)]
+                    Utf8(Utf8Error),
+                }
+
+                let res: Result<Vec<HashMap<_, _>>, _> = matches
+                    .map(|m| {
+                        capture_indices
+                            .iter()
+                            .map(|(name, &index)| {
+                                m.nodes_for_capture_index(index)
+                                    .single()
+                                    .map_err(Err::Single)
+                                    .and_then(|node| {
+                                        node.utf8_text(&source_text).map_err(Err::Utf8)
+                                    })
+                                    .map(|text| (name, text))
+                            })
+                            .collect()
+                    })
+                    .collect();
+
+                let captures = res.into_diagnostic()?;
+
+                print!("{:#?}", captures);
+            }
+        }
     }
-
-    let query = Query::new(language, &script)?;
-    let mut cursor = QueryCursor::new();
-    let matches = cursor.matches(&query, tree.root_node(), source_text.as_slice());
-
-    let v: Result<Vec<_>, _> = matches
-        .flat_map(|m| {
-            m.captures
-                .iter()
-                .zip(query.capture_names())
-                .map(|(capture, name)| {
-                    capture
-                        .node
-                        .utf8_text(&source_text)
-                        .map(|text| (name, text))
-                })
-        })
-        .collect();
-
-    println!("{:#?}", v?);
 
     Ok(())
 }
