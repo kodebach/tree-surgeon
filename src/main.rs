@@ -1,15 +1,13 @@
 use std::{
     fs,
     io::{self, Read},
-    path::{Path, PathBuf},
+    path::PathBuf,
 };
 
 use clap::Parser;
 use miette::IntoDiagnostic;
 
-use nom::error;
-use tree_sitter::{Language, Parser as TreeParser};
-use tree_surgeon::{dsl::ast::Script, dsl::parser::Parsable, interpreter::Interpreter};
+use tree_surgeon::interpreter::Interpreter;
 
 #[derive(clap::Parser, Debug)]
 #[clap(author, version, about, long_about=None)]

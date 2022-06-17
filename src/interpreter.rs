@@ -4,7 +4,10 @@ use miette::IntoDiagnostic;
 use tree_sitter::{Language, Parser, QueryCursor, Tree};
 
 use crate::{
-    dsl::{ast::{Match, Script, Statement}, parser::Parsable},
+    dsl::{
+        ast::{Match, Script, Statement},
+        parser::Parsable,
+    },
     single::{Single, SingleError},
 };
 
@@ -73,15 +76,28 @@ impl Interpreter {
             .collect();
 
         let res: Result<Vec<HashMap<_, _>>, _> = matches
-            .map(|m| {
+            .map(|query_match| {
                 capture_indices
                     .iter()
                     .map(|(name, &index)| {
-                        m.nodes_for_capture_index(index)
+                        query_match
+                            .nodes_for_capture_index(index)
                             .single()
                             .map_err(MatchError::Single)
                             .and_then(|node| node.utf8_text(source).map_err(MatchError::Utf8))
-                            .map(|text| (name, text))
+                            .map(|text| {
+                                (
+                                    name,
+                                    (
+                                        text,
+                                        if m.replacement().capture_name() == *name {
+                                            Some(m.replacement().replacement())
+                                        } else {
+                                            None
+                                        },
+                                    ),
+                                )
+                            })
                     })
                     .collect()
             })

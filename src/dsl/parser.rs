@@ -1,9 +1,9 @@
 use nom::{
     branch::alt,
-    character::complete::{char as nom_char, multispace0, satisfy},
+    character::complete::{char as nom_char, multispace0, multispace1, satisfy},
     combinator::eof,
     multi::{many0, many1, many_till},
-    sequence::{delimited, tuple},
+    sequence::{delimited, separated_pair, tuple},
     IResult, Parser,
 };
 
@@ -17,14 +17,17 @@ use miette::{Diagnostic, LabeledSpan, SourceCode};
 use nom_supreme::error::GenericErrorTree;
 use thiserror::Error;
 
-use super::ast::{Match, Script, Statement};
+use super::{
+    ast::{Match, Replacement, Script, Statement},
+    string::parse_string,
+};
 
 type InputData<'a> = Located<'a, str>;
 type Input<'a> = Stateful<InputData<'a>, ParserState>;
 type ErrorTree<'i> = nom_supreme::error::ErrorTree<Input<'i>>;
 type ParseResult<'a, T> = IResult<Input<'a>, T, ErrorTree<'a>>;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ParserState {
     language: Language,
 }
@@ -145,24 +148,45 @@ fn parse_sexpr<'a>(input: Input<'a>) -> ParseResult<&'a str> {
 }
 
 fn parse_match<'a>(input: Input<'a>) -> ParseResult<Match> {
+    let query = parse_sexpr
+        .context("query")
+        .preceded_by(multispace0)
+        .map_res(|query| Query::new(input.state.language, query));
+
+    let capture_ref = nom_char('@')
+        .context("capture reference")
+        .precedes(many1(satisfy(|c| {
+            !c.is_whitespace() && c != '(' && c != ')'
+        })))
+        .map(|v| v.into_iter().collect());
+
+    let replacement = tag_no_case("REPLACE")
+        .context("replacement")
+        .preceded_by(multispace0)
+        .precedes(
+            separated_pair(
+                capture_ref.preceded_by(multispace0),
+                tag_no_case("WITH").preceded_by(multispace1),
+                parse_string.preceded_by(multispace0),
+            )
+            .map(|(c, r)| Replacement::new(c, r)),
+        );
+
     tag_no_case("MATCH")
         .preceded_by(multispace0)
         .cut()
-        .context("MATCH")
-        .and(
-            parse_sexpr
-                .context("query")
-                .delimited_by(multispace0)
-                .map_res(|query| Query::new(input.state.language, query)),
-        )
-        .map(|(_, query)| Match::new(query))
+        .context("match")
+        .and(query)
+        .and(replacement)
+        .map(|((_, query), replacement)| Match::new(query, replacement))
         .parse(input)
 }
 
 fn parse_statement<'a>(input: Input<'a>) -> ParseResult<Statement> {
     alt((parse_match.map(Statement::Match),))
+        .terminated(nom_char(';').preceded_by(multispace0))
         .context("statement")
-        .preceded_by(multispace0)
+        .delimited_by(multispace0)
         .cut()
         .parse(input)
 }
