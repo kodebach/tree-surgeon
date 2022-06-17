@@ -10,8 +10,9 @@ use miette::IntoDiagnostic;
 use thiserror::Error;
 use tree_sitter::{Language, Parser as TreeParser, QueryCursor};
 use tree_surgeon::{
-    dsl::ast::ScriptParser,
-    single::{self, Single},
+    dsl::ast::Script,
+    dsl::parser::Parsable,
+    single::{Single, SingleError},
 };
 
 extern "C" {
@@ -54,8 +55,7 @@ fn main() -> miette::Result<()> {
         source
     };
 
-    let parser = ScriptParser::new(script_source);
-    let script = parser.parse(language).map_err(|e| e.into_owned())?;
+    let script = Script::parse(&script_source, language).map_err(|e| e.into_owned())?;
 
     for statement in script.statements() {
         match statement {
@@ -77,7 +77,7 @@ fn main() -> miette::Result<()> {
                 #[derive(Debug, Error)]
                 enum Err {
                     #[error(transparent)]
-                    Single(single::Error),
+                    Single(SingleError),
                     #[error(transparent)]
                     Utf8(Utf8Error),
                 }

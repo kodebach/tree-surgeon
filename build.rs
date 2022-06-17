@@ -6,5 +6,6 @@ fn main() {
     cc::Build::new()
         .include(&dir)
         .file(dir.join("parser.c"))
+        .flag("-Wno-unused-but-set-variable")
         .compile("tree-sitter-c");
 }

@@ -1,11 +1,11 @@
 use thiserror::Error;
 
 pub trait Single: Iterator {
-    fn single(self) -> Result<Self::Item, Error>;
+    fn single(self) -> Result<Self::Item, SingleError>;
 }
 
-#[derive(Debug, Error)]
-pub enum Error {
+#[derive(Debug, Error, PartialEq)]
+pub enum SingleError {
     #[error("Called single() on empty iterator")]
     NoElements,
     #[error("Called single() on multiple-element iterator")]
@@ -13,12 +13,12 @@ pub enum Error {
 }
 
 impl<I: Iterator> Single for I {
-    fn single(mut self) -> Result<Self::Item, Error> {
+    fn single(mut self) -> Result<Self::Item, SingleError> {
         match self.next() {
-            None => Err(Error::NoElements),
+            None => Err(SingleError::NoElements),
             Some(element) => match self.next() {
                 None => Ok(element),
-                Some(_) => Err(Error::MultipleElements),
+                Some(_) => Err(SingleError::MultipleElements),
             },
         }
     }
