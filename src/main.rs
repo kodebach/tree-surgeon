@@ -101,7 +101,7 @@ fn main() -> miette::Result<()> {
 
                 let captures = res.into_diagnostic()?;
 
-                print!("{:#?}", captures);
+                println!("{:#?}", captures);
             }
         }
     }
