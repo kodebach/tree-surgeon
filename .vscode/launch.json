@@ -39,7 +39,7 @@
                 }
             },
             "args": [
-                "../libelektra/src/libs/elektra/key.c"
+                "${input:file}",
             ],
             "cwd": "${workspaceFolder}"
         },
@@ -61,6 +61,14 @@
             },
             "args": [],
             "cwd": "${workspaceFolder}"
+        }
+    ],
+    "inputs": [
+        {
+            "id": "file",
+            "type": "promptString",
+            "description": "Path",
+            "default": "../libelektra/src/libs/elektra/key.c"
         }
     ]
 }
