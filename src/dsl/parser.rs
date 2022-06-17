@@ -73,24 +73,38 @@ impl Diagnostic for ParseError<'_> {
 
     fn labels(&self) -> Option<Box<dyn Iterator<Item = LabeledSpan> + '_>> {
         fn labels<'a>(
+            input_size: usize,
             error: &'a nom_supreme::error::ErrorTree<usize>,
         ) -> Box<dyn Iterator<Item = LabeledSpan> + 'a> {
             match error {
                 GenericErrorTree::Base { location, kind } => Box::new(
-                    Some(LabeledSpan::new(Some(format!("{}", kind)), *location, 1)).into_iter(),
+                    Some(LabeledSpan::new(
+                        Some(format!("{}", kind)),
+                        (input_size - 1).min(*location),
+                        1,
+                    ))
+                    .into_iter(),
                 ),
-                GenericErrorTree::Stack { base, contexts } => Box::new(labels(base).chain(
-                    contexts.iter().map(|(location, context)| {
-                        LabeledSpan::new(Some(format!("{}", context)), *location, 1)
-                    }),
-                )),
-                GenericErrorTree::Alt(ref trees) => Box::new(trees.iter().flat_map(labels)),
+                GenericErrorTree::Stack { base, contexts } => {
+                    Box::new(labels(input_size, base).chain(contexts.iter().map(
+                        move |(location, context)| {
+                            LabeledSpan::new(
+                                Some(format!("{}", context)),
+                                (input_size - 1).min(*location),
+                                1,
+                            )
+                        },
+                    )))
+                }
+                GenericErrorTree::Alt(ref trees) => Box::new(
+                    trees
+                        .iter()
+                        .flat_map(move |error| labels(input_size, error)),
+                ),
             }
         }
 
-        let l = Vec::from_iter(labels(&self.error));
-        eprintln!("{}", self.error);
-        Some(Box::new(l.into_iter()))
+        Some(labels(self.input.len(), &self.error))
     }
 }
 
@@ -101,10 +115,7 @@ where
     delimited(
         nom_char('('),
         inner.preceded_by(multispace0),
-        nom_char(')')
-            .preceded_by(multispace0)
-            .cut()
-            .context("closing paren"),
+        nom_char(')').preceded_by(multispace0).cut(),
     )
 }
 
@@ -140,6 +151,7 @@ fn parse_match<'a>(input: Input<'a>) -> ParseResult<Match> {
         .context("MATCH")
         .and(
             parse_sexpr
+                .context("query")
                 .delimited_by(multispace0)
                 .map_res(|query| Query::new(input.state.language, query)),
         )
@@ -149,8 +161,8 @@ fn parse_match<'a>(input: Input<'a>) -> ParseResult<Match> {
 
 fn parse_statement<'a>(input: Input<'a>) -> ParseResult<Statement> {
     alt((parse_match.map(Statement::Match),))
-        .preceded_by(multispace0)
         .context("statement")
+        .preceded_by(multispace0)
         .cut()
         .parse(input)
 }
