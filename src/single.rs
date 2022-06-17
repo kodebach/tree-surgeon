@@ -26,18 +26,21 @@ impl<I: Iterator> Single for I {
 
 #[cfg(test)]
 mod test {
-    use super::Single;
+    use super::{Single, SingleError};
     use std::iter;
 
     #[test]
-    #[should_panic(expected = "Called single() on empty iterator")]
-    fn panic_empty() {
-        let _: i32 = iter::empty().single().unwrap();
+    fn empty_error() {
+        assert_eq!(iter::empty::<i32>().single(), Err(SingleError::NoElements));
     }
 
     #[test]
-    #[should_panic(expected = "Called single() on multiple-element iterator")]
-    fn panic_multiple() {
-        let _ = iter::repeat(0).single().unwrap();
+    fn multiple_error() {
+        assert_eq!(iter::repeat(0).single(), Err(SingleError::MultipleElements));
+    }
+
+    #[test]
+    fn single_success() {
+        assert_eq!(iter::repeat(0).single(), Err(SingleError::MultipleElements));
     }
 }
