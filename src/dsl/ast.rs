@@ -1,5 +1,8 @@
 use tree_sitter::Query;
 
+pub type Span = std::ops::Range<usize>;
+pub type Spanned<T> = (T, Span);
+
 #[derive(Debug)]
 pub struct Script {
     statements: Vec<Statement>,

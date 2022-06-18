@@ -1,5 +1,11 @@
-use std::{collections::HashMap, fs, path::PathBuf, str::Utf8Error};
+use std::{
+    collections::HashMap,
+    fs,
+    path::PathBuf,
+    str::Utf8Error, io::Read,
+};
 
+use ariadne::Source;
 use miette::IntoDiagnostic;
 use tree_sitter::{Language, Parser, QueryCursor, Tree};
 
@@ -31,8 +37,14 @@ struct TreeParseError {
     source_file: PathBuf,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("couldn't parse the script {script_file}")]
+struct ScriptParseError {
+    script_file: PathBuf,
+}
+
 impl Interpreter {
-    pub fn new(source_file: PathBuf, script_source: String) -> miette::Result<Interpreter> {
+    pub fn new(source_file: PathBuf, script_file: Option<PathBuf>) -> miette::Result<Interpreter> {
         extern "C" {
             fn tree_sitter_c() -> Language;
         }
@@ -42,6 +54,18 @@ impl Interpreter {
             .set_language(unsafe { tree_sitter_c() })
             .into_diagnostic()?;
 
+        let script_source = if let Some(ref script_file) = script_file {
+            let script_buf = fs::read(&script_file).into_diagnostic()?;
+
+            String::from_utf8(script_buf).into_diagnostic()?
+        } else {
+            let stdin = std::io::stdin();
+            let mut source = String::new();
+            stdin.lock().read_to_string(&mut source).into_diagnostic()?;
+
+            source
+        };
+
         let source = fs::read(&source_file).into_diagnostic()?;
 
         let tree = parser
@@ -49,7 +73,19 @@ impl Interpreter {
             .ok_or(TreeParseError { source_file })
             .into_diagnostic()?;
 
-        let script = Script::parse(&script_source, tree.language()).map_err(|e| e.into_owned())?;
+        let (script, reports) = Script::parse(&script_source, tree.language());
+
+        for report in reports {
+            report
+                .print(Source::from(&script_source))
+                .into_diagnostic()?;
+        }
+
+        let script = script
+            .ok_or(ScriptParseError {
+                script_file: script_file.unwrap_or(PathBuf::from("<stdin>")),
+            })
+            .into_diagnostic()?;
 
         Ok(Interpreter {
             source,

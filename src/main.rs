@@ -16,25 +16,13 @@ struct Cli {
     source_file: PathBuf,
 
     #[clap(value_parser)]
-    script_file: Option<String>,
+    script_file: Option<PathBuf>,
 }
 
 fn main() -> miette::Result<()> {
     let cli = Cli::parse();
 
-    let script_source = if let Some(script_file) = cli.script_file {
-        let script_buf = fs::read(&script_file).into_diagnostic()?;
-
-        String::from_utf8(script_buf).into_diagnostic()?
-    } else {
-        let stdin = io::stdin();
-        let mut source = String::new();
-        stdin.lock().read_to_string(&mut source).into_diagnostic()?;
-
-        source
-    };
-
-    let interpreter = Interpreter::new(cli.source_file, script_source)?;
+    let interpreter = Interpreter::new(cli.source_file, cli.script_file)?;
 
     interpreter.run()
 }
