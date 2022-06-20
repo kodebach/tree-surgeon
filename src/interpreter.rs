@@ -1,4 +1,9 @@
-use std::{fs, io::Read, path::PathBuf};
+use std::{
+    ffi::OsStr,
+    fs,
+    io::Read,
+    path::{Path, PathBuf},
+};
 
 use ariadne::Source;
 use miette::IntoDiagnostic;
@@ -13,6 +18,7 @@ use crate::{
 };
 
 pub struct Interpreter {
+    source_file: PathBuf,
     source: Vec<u8>,
     tree: Tree,
     script: Script,
@@ -47,9 +53,32 @@ struct ScriptParseError {
 #[error("interpreter received invalid statement")]
 struct InvalidStatementError;
 
+fn parse_source(
+    parser: &mut Parser,
+    source_file: &PathBuf,
+    source: &Vec<u8>,
+    old_tree: Option<&Tree>,
+) -> Result<Tree, TreeParseError> {
+    parser
+        .parse(source, old_tree)
+        .ok_or(TreeParseError {
+            source_file: source_file.clone(),
+        })
+        .and_then(|tree| {
+            if tree.root_node().has_error() {
+                Err(TreeParseError {
+                    source_file: source_file.clone(),
+                })
+            } else {
+                Ok(tree)
+            }
+        })
+}
+
 fn execute_match(
     m: &Match,
     parser: &mut Parser,
+    source_file: &PathBuf,
     source: &mut Vec<u8>,
     tree: &mut Tree,
 ) -> miette::Result<()> {
@@ -112,11 +141,7 @@ fn execute_match(
 
             tree.edit(&edit);
 
-            *tree = parser
-                .parse(source.clone(), Some(tree))
-                .ok_or(TreeParseError {
-                    source_file: PathBuf::from("<edited>"),
-                })
+            *tree = parse_source(parser, &PathBuf::from("<edited>"), source, Some(tree))
                 .into_diagnostic()?;
         } else {
             break Ok(());
@@ -127,11 +152,12 @@ fn execute_match(
 fn execute_statement(
     statement: &Statement,
     parser: &mut Parser,
+    source_file: &PathBuf,
     source: &mut Vec<u8>,
     tree: &mut Tree,
 ) -> miette::Result<()> {
     match statement {
-        Statement::Match(m) => execute_match(m, parser, source, tree),
+        Statement::Match(m) => execute_match(m, parser, source_file, source, tree),
         Statement::Invalid => Err(InvalidStatementError).into_diagnostic()?,
     }
 }
@@ -161,10 +187,7 @@ impl Interpreter {
 
         let source = fs::read(&source_file).into_diagnostic()?;
 
-        let tree = parser
-            .parse(&source, Option::None)
-            .ok_or(TreeParseError { source_file })
-            .into_diagnostic()?;
+        let tree = parse_source(&mut parser, &source_file, &source, None).into_diagnostic()?;
 
         let (script, reports) = Script::parse(&script_source, tree.language());
 
@@ -182,6 +205,7 @@ impl Interpreter {
 
         Ok(Interpreter {
             source,
+            source_file,
             tree,
             script,
             parser,
@@ -193,6 +217,7 @@ impl Interpreter {
             execute_statement(
                 statement,
                 &mut self.parser,
+                &self.source_file,
                 &mut self.source,
                 &mut self.tree,
             )?
