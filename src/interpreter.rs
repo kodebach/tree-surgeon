@@ -1,8 +1,8 @@
-use std::{collections::HashMap, fs, io::Read, path::PathBuf, str::Utf8Error};
+use std::{fs, io::Read, path::PathBuf};
 
 use ariadne::Source;
 use miette::IntoDiagnostic;
-use tree_sitter::{Language, Parser, QueryCursor, Tree};
+use tree_sitter::{InputEdit, Language, Parser, Point, QueryCursor, Tree};
 
 use crate::{
     dsl::{
@@ -16,14 +16,19 @@ pub struct Interpreter {
     source: Vec<u8>,
     tree: Tree,
     script: Script,
+    parser: Parser,
 }
 
 #[derive(Debug, thiserror::Error)]
 enum MatchError {
     #[error(transparent)]
     Single(SingleError),
-    #[error(transparent)]
-    Utf8(Utf8Error),
+}
+
+#[derive(Debug, thiserror::Error)]
+enum ReplacementError {
+    #[error("capture {capture_name} not found")]
+    MissingCapture { capture_name: String },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -41,6 +46,95 @@ struct ScriptParseError {
 #[derive(Debug, thiserror::Error)]
 #[error("interpreter received invalid statement")]
 struct InvalidStatementError;
+
+fn execute_match(
+    m: &Match,
+    parser: &mut Parser,
+    source: &mut Vec<u8>,
+    tree: &mut Tree,
+) -> miette::Result<()> {
+    let query = m.query();
+
+    let mut cursor = QueryCursor::new();
+
+    loop {
+        let old_tree = tree.clone();
+        let old_source = source.clone();
+
+        let mut matches = cursor.matches(&query, old_tree.root_node(), old_source.as_slice());
+
+        if let Some(query_match) = matches.next() {
+            let capture_name = m.replacement().capture_name();
+            let replacement = m.replacement().replacement();
+
+            let capture_index =
+                if let Some(capture_index) = query.capture_index_for_name(capture_name) {
+                    capture_index
+                } else {
+                    Err(ReplacementError::MissingCapture {
+                        capture_name: capture_name.to_string(),
+                    })
+                    .into_diagnostic()?;
+                    unreachable!("reached line after error");
+                };
+
+            let node = query_match
+                .nodes_for_capture_index(capture_index)
+                .single()
+                .map_err(MatchError::Single)
+                .into_diagnostic()?;
+
+            let start_byte = node.start_byte();
+            let old_end_byte = node.end_byte();
+            let start_position = node.start_position();
+            let old_end_position = node.end_position();
+
+            let line_ending_count = replacement.chars().filter(|c| *c == '\n').count();
+            let last_line_len = replacement.chars().rev().take_while(|c| *c != '\n').count();
+
+            let edit = InputEdit {
+                start_byte,
+                old_end_byte,
+                start_position,
+                old_end_position,
+                new_end_byte: start_byte + replacement.len(),
+                new_end_position: Point {
+                    row: start_position.row + line_ending_count,
+                    column: if line_ending_count == 0 {
+                        start_position.column + replacement.len()
+                    } else {
+                        last_line_len
+                    },
+                },
+            };
+
+            source.splice(edit.start_byte..edit.old_end_byte, replacement.bytes());
+
+            tree.edit(&edit);
+
+            *tree = parser
+                .parse(source.clone(), Some(tree))
+                .ok_or(TreeParseError {
+                    source_file: PathBuf::from("<edited>"),
+                })
+                .into_diagnostic()?;
+        } else {
+            break Ok(());
+        }
+    }
+}
+
+fn execute_statement(
+    statement: &Statement,
+    parser: &mut Parser,
+    source: &mut Vec<u8>,
+    tree: &mut Tree,
+) -> miette::Result<()> {
+    match statement {
+        Statement::Match(m) => execute_match(m, parser, source, tree),
+        Statement::Invalid => Err(InvalidStatementError).into_diagnostic()?,
+    }
+}
 
 impl Interpreter {
     pub fn new(source_file: PathBuf, script_file: Option<PathBuf>) -> miette::Result<Interpreter> {
@@ -90,72 +184,21 @@ impl Interpreter {
             source,
             tree,
             script,
+            parser,
         })
     }
 
-    fn execute_match(&self, m: &Match) -> miette::Result<()> {
-        let query = m.query();
-
-        let mut cursor = QueryCursor::new();
-        let source = self.source.as_slice();
-        let matches = cursor.matches(&query, self.tree.root_node(), source);
-
-        let capture_indices: HashMap<_, _> = query
-            .capture_names()
-            .iter()
-            .filter_map(|name| {
-                query
-                    .capture_index_for_name(name)
-                    .map(|index| (name, index))
-            })
-            .collect();
-
-        let res: Result<Vec<HashMap<_, _>>, _> = matches
-            .map(|query_match| {
-                capture_indices
-                    .iter()
-                    .map(|(name, &index)| {
-                        query_match
-                            .nodes_for_capture_index(index)
-                            .single()
-                            .map_err(MatchError::Single)
-                            .and_then(|node| node.utf8_text(source).map_err(MatchError::Utf8))
-                            .map(|text| {
-                                (
-                                    name,
-                                    (
-                                        text,
-                                        if m.replacement().capture_name() == *name {
-                                            Some(m.replacement().replacement())
-                                        } else {
-                                            None
-                                        },
-                                    ),
-                                )
-                            })
-                    })
-                    .collect()
-            })
-            .collect();
-
-        let captures = res.into_diagnostic()?;
-
-        println!("{:#?}", captures);
-
-        Ok(())
-    }
-
-    fn execute_statement(&self, statement: &Statement) -> miette::Result<()> {
-        match statement {
-            Statement::Match(m) => self.execute_match(m),
-            Statement::Invalid => Err(InvalidStatementError).into_diagnostic()?,
-        }
-    }
-
-    pub fn run(&self) -> miette::Result<()> {
+    pub fn run(mut self) -> miette::Result<()> {
         for statement in self.script.statements() {
-            self.execute_statement(statement)?
+            execute_statement(
+                statement,
+                &mut self.parser,
+                &mut self.source,
+                &mut self.tree,
+            )?
         }
+
+        print!("{}", String::from_utf8(self.source).into_diagnostic()?);
 
         Ok(())
     }
