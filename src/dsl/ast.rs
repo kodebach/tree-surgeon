@@ -23,6 +23,7 @@ pub struct Replacement {
 #[derive(Debug)]
 pub enum Statement {
     Match(Match),
+    Invalid,
 }
 
 impl Replacement {

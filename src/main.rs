@@ -1,11 +1,6 @@
-use std::{
-    fs,
-    io::{self, Read},
-    path::PathBuf,
-};
+use std::path::PathBuf;
 
 use clap::Parser;
-use miette::IntoDiagnostic;
 
 use tree_surgeon::interpreter::Interpreter;
 

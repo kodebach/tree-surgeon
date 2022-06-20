@@ -1,9 +1,4 @@
-use std::{
-    collections::HashMap,
-    fs,
-    path::PathBuf,
-    str::Utf8Error, io::Read,
-};
+use std::{collections::HashMap, fs, io::Read, path::PathBuf, str::Utf8Error};
 
 use ariadne::Source;
 use miette::IntoDiagnostic;
@@ -42,6 +37,10 @@ struct TreeParseError {
 struct ScriptParseError {
     script_file: PathBuf,
 }
+
+#[derive(Debug, thiserror::Error)]
+#[error("interpreter received invalid statement")]
+struct InvalidStatementError;
 
 impl Interpreter {
     pub fn new(source_file: PathBuf, script_file: Option<PathBuf>) -> miette::Result<Interpreter> {
@@ -149,6 +148,7 @@ impl Interpreter {
     fn execute_statement(&self, statement: &Statement) -> miette::Result<()> {
         match statement {
             Statement::Match(m) => self.execute_match(m),
+            Statement::Invalid => Err(InvalidStatementError).into_diagnostic()?,
         }
     }
 
