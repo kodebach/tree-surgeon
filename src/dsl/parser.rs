@@ -43,8 +43,14 @@ enum Keyword {
     With,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, derive_more::Display)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct Str(String);
+
+impl fmt::Display for Str {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "\"{}\"", self.0.escape_default())
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct Capture(String);
