@@ -14,6 +14,4 @@ derive_more = "0.99.17"
 miette = { version = "4.7.1", features = ["fancy"] }
 thiserror = "1.0.31"
 tree-sitter = "0.20.6"
-
-[build-dependencies]
-cc = "*"
+tree-sitter-c = { path = "tree-sitter-c", version = "0.20.1" }

@@ -164,13 +164,9 @@ fn execute_statement(
 
 impl Interpreter {
     pub fn new(source_file: PathBuf, script_file: Option<PathBuf>) -> miette::Result<Interpreter> {
-        extern "C" {
-            fn tree_sitter_c() -> Language;
-        }
-
         let mut parser = Parser::new();
         parser
-            .set_language(unsafe { tree_sitter_c() })
+            .set_language(tree_sitter_c::language())
             .into_diagnostic()?;
 
         let script_source = if let Some(ref script_file) = script_file {

@@ -541,18 +541,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "tree-sitter-c"
+version = "0.20.1"
+dependencies = [
+ "cc",
+ "tree-sitter",
+]
+
+[[package]]
 name = "tree-surgeon"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "ariadne",
- "cc",
  "chumsky",
  "clap",
  "derive_more",
  "miette",
  "thiserror",
  "tree-sitter",
+ "tree-sitter-c",
 ]
 
 [[package]]
