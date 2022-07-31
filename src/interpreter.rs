@@ -1,13 +1,14 @@
 use std::{
-    ffi::OsStr,
-    fs,
+    collections::HashMap,
+    fmt, fs,
     io::Read,
+    ops::Range,
     path::{Path, PathBuf},
 };
 
-use ariadne::Source;
-use miette::IntoDiagnostic;
-use tree_sitter::{InputEdit, Language, Parser, Point, QueryCursor, Tree};
+use ariadne::{Cache, Color, FileCache, Label, Report, ReportKind, Source, Span};
+use miette::{Diagnostic, IntoDiagnostic};
+use tree_sitter::{InputEdit, Node, Parser, Point, QueryCursor, Tree, TreeCursor};
 
 use crate::{
     dsl::{
@@ -53,26 +54,75 @@ struct ScriptParseError {
 #[error("interpreter received invalid statement")]
 struct InvalidStatementError;
 
+#[derive(Debug, thiserror::Error)]
+#[error("tree-sitter returned additional errors after executing the script")]
+struct MoreErrorsAfterRunError;
+
+struct TreeErrorIter<'a>(TreeCursor<'a>);
+
+impl<'a> Iterator for TreeErrorIter<'a> {
+    type Item = Node<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        fn goto_next(cursor: &mut TreeCursor) -> bool {
+            while !cursor.goto_next_sibling() {
+                if !cursor.goto_parent() {
+                    return false;
+                }
+            }
+
+            true
+        }
+
+        loop {
+            let node = self.0.node();
+            if node.is_error() {
+                goto_next(&mut self.0);
+                return Some(node);
+            } else {
+                if self.0.goto_first_child() {
+                    continue;
+                }
+            }
+
+            if !goto_next(&mut self.0) {
+                break;
+            }
+        }
+
+        None
+    }
+}
+
 fn parse_source(
     parser: &mut Parser,
-    source_file: &PathBuf,
     source: &Vec<u8>,
     old_tree: Option<&Tree>,
-) -> Result<Tree, TreeParseError> {
-    parser
-        .parse(source, old_tree)
-        .ok_or(TreeParseError {
-            source_file: source_file.clone(),
-        })
-        .and_then(|tree| {
-            if tree.root_node().has_error() {
-                Err(TreeParseError {
-                    source_file: source_file.clone(),
-                })
-            } else {
-                Ok(tree)
-            }
-        })
+) -> (Option<Tree>, Vec<Report>) {
+    let tree = parser.parse(source, old_tree);
+
+    if let Some(tree) = tree {
+        let error_iter = TreeErrorIter(tree.walk());
+
+        let errors = error_iter
+            .map(|node| {
+                let parent = node.parent().unwrap_or(node);
+                Report::build(ReportKind::Advice, (), node.start_byte())
+                    .with_message("tree-sitter couldn't parse code fragment")
+                    .with_label(Label::new(parent.byte_range()).with_message(parent.to_sexp()))
+                    .with_label(
+                        Label::new(node.byte_range())
+                            .with_message(node.to_sexp())
+                            .with_color(Color::Red),
+                    )
+                    .finish()
+            })
+            .collect();
+
+        (Some(tree), errors)
+    } else {
+        (None, Vec::new())
+    }
 }
 
 fn execute_match(
@@ -141,7 +191,12 @@ fn execute_match(
 
             tree.edit(&edit);
 
-            *tree = parse_source(parser, &PathBuf::from("<edited>"), source, Some(tree))
+            let (new_tree, _) = parse_source(parser, &source, Some(tree));
+
+            *tree = new_tree
+                .ok_or(TreeParseError {
+                    source_file: source_file.to_owned(),
+                })
                 .into_diagnostic()?;
         } else {
             break Ok(());
@@ -159,6 +214,20 @@ fn execute_statement(
     match statement {
         Statement::Match(m) => execute_match(m, parser, source_file, source, tree),
         Statement::Invalid => Err(InvalidStatementError).into_diagnostic()?,
+    }
+}
+
+trait ParseResult<T, S> {
+    fn print_reports(self, source: S) -> std::io::Result<T>;
+}
+
+impl<'a, T, S: AsRef<str>> ParseResult<T, S> for (T, Vec<Report>) {
+    fn print_reports(self, source: S) -> std::io::Result<T> {
+        for report in &self.1 {
+            report.eprint(Source::from(&source))?;
+        }
+
+        Ok(self.0)
     }
 }
 
@@ -183,17 +252,33 @@ impl Interpreter {
 
         let source = fs::read(&source_file).into_diagnostic()?;
 
-        let tree = parse_source(&mut parser, &source_file, &source, None).into_diagnostic()?;
+        let tree_with_errors = parse_source(&mut parser, &source, None);
 
-        let (script, reports) = Script::parse(&script_source, tree.language());
+        let report: Report = if let (None, _) = &tree_with_errors {
+            Report::build(ReportKind::Error, (), 0)
+                .with_message("tree-sitter couldn't parse source file")
+                .finish()
+        } else {
+            Report::build(ReportKind::Warning, (), 0)
+                .with_message("tree-sitter returned parse errors")
+                .finish()
+        };
 
-        for report in reports {
-            report
-                .print(Source::from(&script_source))
-                .into_diagnostic()?;
-        }
+        report
+            .eprint(Source::from(&script_source))
+            .into_diagnostic()?;
 
-        let script = script
+        let tree = tree_with_errors
+            .print_reports(String::from_utf8_lossy(&source))
+            .into_diagnostic()?
+            .ok_or(TreeParseError {
+                source_file: source_file.to_owned(),
+            })
+            .into_diagnostic()?;
+
+        let script = Script::parse(&script_source, tree.language())
+            .print_reports(&script_source)
+            .into_diagnostic()?
             .ok_or(ScriptParseError {
                 script_file: script_file.unwrap_or(PathBuf::from("<stdin>")),
             })
