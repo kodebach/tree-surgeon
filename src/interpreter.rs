@@ -24,6 +24,7 @@ pub struct Interpreter {
     tree: Tree,
     script: Script,
     parser: Parser,
+    verbose: bool,
 }
 
 #[derive(Diagnostic, Debug, thiserror::Error)]
@@ -165,6 +166,7 @@ fn execute_match(
     source_file: &PathBuf,
     source: &mut Vec<u8>,
     tree: &mut Tree,
+    verbose: bool,
 ) -> Result<(), MatchError> {
     fn error_ancestor(node: Node) -> Option<Node> {
         if let Some(parent) = node.parent() {
@@ -264,7 +266,7 @@ fn execute_match(
                 .map_err(MatchError::Io)?;
 
             *tree = tree_with_errors
-                .print_reports(String::from_utf8_lossy(&source))
+                .print_reports(String::from_utf8_lossy(&source), verbose)
                 .map_err(MatchError::Io)?
                 .ok_or(MatchError::Replacement(ReplacementError::TreeParse(
                     TreeParseError {
@@ -283,23 +285,25 @@ fn execute_statement(
     source_file: &PathBuf,
     source: &mut Vec<u8>,
     tree: &mut Tree,
+    verbose: bool,
 ) -> Result<(), StatementError> {
     match statement {
-        Statement::Match(m) => {
-            execute_match(m, parser, source_file, source, tree).map_err(StatementError::Match)
-        }
+        Statement::Match(m) => execute_match(m, parser, source_file, source, tree, verbose)
+            .map_err(StatementError::Match),
         Statement::Invalid => Err(StatementError::Invalid),
     }
 }
 
 trait ParseResult<T, S> {
-    fn print_reports(self, source: S) -> std::io::Result<T>;
+    fn print_reports(self, source: S, verbose: bool) -> std::io::Result<T>;
 }
 
 impl<'a, T, S: AsRef<str>> ParseResult<T, S> for (T, Vec<Report>) {
-    fn print_reports(self, source: S) -> std::io::Result<T> {
-        for report in &self.1 {
-            report.eprint(Source::from(&source))?;
+    fn print_reports(self, source: S, verbose: bool) -> std::io::Result<T> {
+        if verbose {
+            for report in &self.1 {
+                report.eprint(Source::from(&source))?;
+            }
         }
 
         Ok(self.0)
@@ -307,7 +311,11 @@ impl<'a, T, S: AsRef<str>> ParseResult<T, S> for (T, Vec<Report>) {
 }
 
 impl Interpreter {
-    pub fn new(source_file: PathBuf, script_file: Option<PathBuf>) -> miette::Result<Interpreter> {
+    pub fn new(
+        source_file: PathBuf,
+        script_file: Option<PathBuf>,
+        verbose: bool,
+    ) -> miette::Result<Interpreter> {
         let mut parser = Parser::new();
         parser
             .set_language(tree_sitter_c::language())
@@ -344,7 +352,7 @@ impl Interpreter {
             .into_diagnostic()?;
 
         let tree = tree_with_errors
-            .print_reports(String::from_utf8_lossy(&source))
+            .print_reports(String::from_utf8_lossy(&source), verbose)
             .into_diagnostic()?
             .ok_or(TreeParseError {
                 source_file: source_file.to_owned(),
@@ -352,7 +360,7 @@ impl Interpreter {
             .into_diagnostic()?;
 
         let script = Script::parse(&script_source, tree.language())
-            .print_reports(&script_source)
+            .print_reports(&script_source, verbose)
             .into_diagnostic()?
             .ok_or(ScriptParseError {
                 script_file: script_file.unwrap_or(PathBuf::from("<stdin>")),
@@ -365,6 +373,7 @@ impl Interpreter {
             tree,
             script,
             parser,
+            verbose,
         })
     }
 
@@ -376,6 +385,7 @@ impl Interpreter {
                 &self.source_file,
                 &mut self.source,
                 &mut self.tree,
+                self.verbose,
             )?
         }
 
