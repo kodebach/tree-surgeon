@@ -7,7 +7,7 @@ use std::{
 };
 
 use ariadne::{Cache, Color, FileCache, Label, Report, ReportKind, Source, Span};
-use miette::{Diagnostic, IntoDiagnostic};
+use miette::{Diagnostic, IntoDiagnostic, LabeledSpan, SourceOffset, SourceSpan};
 use tree_sitter::{InputEdit, Node, Parser, Point, QueryCursor, Tree, TreeCursor};
 
 use crate::{
@@ -26,37 +26,71 @@ pub struct Interpreter {
     parser: Parser,
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Diagnostic, Debug, thiserror::Error)]
+enum StatementError {
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    Match(#[from] MatchError),
+    #[error("interpreter received invalid statement")]
+    #[diagnostic(code(tree_surgeon::script::invalid_statement))]
+    Invalid,
+}
+
+#[derive(Diagnostic, Debug, thiserror::Error)]
 enum MatchError {
     #[error(transparent)]
-    Single(SingleError),
+    #[diagnostic(code(tree_surgeon::r#match::single))]
+    Single(#[from] SingleError),
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    Replacement(#[from] ReplacementError),
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    EditInErrorNode(#[from] EditInErrorNode),
+    #[error(transparent)]
+    #[diagnostic(code(tree_surgeon::io_error))]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    #[diagnostic(code(tree_surgeon::string::from_utf8))]
+    Utf8(#[from] std::string::FromUtf8Error),
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Diagnostic, Debug, thiserror::Error)]
 enum ReplacementError {
     #[error("capture {capture_name} not found")]
+    #[diagnostic(code(tree_surgeon::replace::missing_capture))]
     MissingCapture { capture_name: String },
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    TreeParse(#[from] TreeParseError),
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Diagnostic, Debug, thiserror::Error)]
+#[error("tried to make and edit within an error node")]
+#[diagnostic(code(tree_surgeon::script::replace::edit_in_error))]
+struct EditInErrorNode {
+    #[source_code]
+    src: String,
+    error_label: String,
+    #[label("{error_label}")]
+    error_span: SourceSpan,
+    #[label("tried to edit this")]
+    edit_span: SourceSpan,
+}
+
+#[derive(Diagnostic, Debug, thiserror::Error)]
 #[error("tree-sitter couldn't parse the file {source_file}")]
+#[diagnostic(code(tree_surgeon::tree_sitter::parse_error))]
 struct TreeParseError {
     source_file: PathBuf,
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Diagnostic, Debug, thiserror::Error)]
 #[error("couldn't parse the script {script_file}")]
+#[diagnostic(code(tree_surgeon::script::parse_error))]
 struct ScriptParseError {
     script_file: PathBuf,
 }
-
-#[derive(Debug, thiserror::Error)]
-#[error("interpreter received invalid statement")]
-struct InvalidStatementError;
-
-#[derive(Debug, thiserror::Error)]
-#[error("tree-sitter returned additional errors after executing the script")]
-struct MoreErrorsAfterRunError;
 
 struct TreeErrorIter<'a>(TreeCursor<'a>);
 
@@ -131,7 +165,19 @@ fn execute_match(
     source_file: &PathBuf,
     source: &mut Vec<u8>,
     tree: &mut Tree,
-) -> miette::Result<()> {
+) -> Result<(), MatchError> {
+    fn error_ancestor(node: Node) -> Option<Node> {
+        if let Some(parent) = node.parent() {
+            if parent.is_error() {
+                Some(parent)
+            } else {
+                error_ancestor(parent)
+            }
+        } else {
+            None
+        }
+    }
+
     let query = m.query();
 
     let mut cursor = QueryCursor::new();
@@ -150,23 +196,32 @@ fn execute_match(
                 if let Some(capture_index) = query.capture_index_for_name(capture_name) {
                     capture_index
                 } else {
-                    Err(ReplacementError::MissingCapture {
+                    return Err(MatchError::Replacement(ReplacementError::MissingCapture {
                         capture_name: capture_name.to_string(),
-                    })
-                    .into_diagnostic()?;
-                    unreachable!("reached line after error");
+                    }));
                 };
 
             let node = query_match
                 .nodes_for_capture_index(capture_index)
                 .single()
-                .map_err(MatchError::Single)
-                .into_diagnostic()?;
+                .map_err(MatchError::Single)?;
 
             let start_byte = node.start_byte();
             let old_end_byte = node.end_byte();
             let start_position = node.start_position();
             let old_end_position = node.end_position();
+
+            if let Some(error) = error_ancestor(node) {
+                let error_start_byte = error.start_byte();
+                let error_end_byte = error.end_byte();
+
+                return Err(MatchError::EditInErrorNode(EditInErrorNode {
+                    src: String::from_utf8(source.clone()).map_err(MatchError::Utf8)?,
+                    error_span: (error_start_byte, error_end_byte - error_start_byte).into(),
+                    error_label: error.to_sexp(),
+                    edit_span: (start_byte, old_end_byte - start_byte).into(),
+                }));
+            }
 
             let line_ending_count = replacement.chars().filter(|c| *c == '\n').count();
             let last_line_len = replacement.chars().rev().take_while(|c| *c != '\n').count();
@@ -191,13 +246,31 @@ fn execute_match(
 
             tree.edit(&edit);
 
-            let (new_tree, _) = parse_source(parser, &source, Some(tree));
+            // TODO (opti): instead of re-parsing the tree after every change, try to apply as many changes as possible without overlap before parsing again
+            let tree_with_errors = parse_source(parser, &source, None);
 
-            *tree = new_tree
-                .ok_or(TreeParseError {
-                    source_file: source_file.to_owned(),
-                })
-                .into_diagnostic()?;
+            let report: Report = if let (None, _) = &tree_with_errors {
+                Report::build(ReportKind::Error, (), 0)
+                    .with_message("tree-sitter couldn't parse source file")
+                    .finish()
+            } else {
+                Report::build(ReportKind::Warning, (), 0)
+                    .with_message("tree-sitter returned parse errors")
+                    .finish()
+            };
+
+            report
+                .eprint(Source::from(String::from_utf8_lossy(&source)))
+                .map_err(MatchError::Io)?;
+
+            *tree = tree_with_errors
+                .print_reports(String::from_utf8_lossy(&source))
+                .map_err(MatchError::Io)?
+                .ok_or(MatchError::Replacement(ReplacementError::TreeParse(
+                    TreeParseError {
+                        source_file: source_file.to_owned(),
+                    },
+                )))?;
         } else {
             break Ok(());
         }
@@ -210,10 +283,12 @@ fn execute_statement(
     source_file: &PathBuf,
     source: &mut Vec<u8>,
     tree: &mut Tree,
-) -> miette::Result<()> {
+) -> Result<(), StatementError> {
     match statement {
-        Statement::Match(m) => execute_match(m, parser, source_file, source, tree),
-        Statement::Invalid => Err(InvalidStatementError).into_diagnostic()?,
+        Statement::Match(m) => {
+            execute_match(m, parser, source_file, source, tree).map_err(StatementError::Match)
+        }
+        Statement::Invalid => Err(StatementError::Invalid),
     }
 }
 
@@ -265,7 +340,7 @@ impl Interpreter {
         };
 
         report
-            .eprint(Source::from(&script_source))
+            .eprint(Source::from(String::from_utf8_lossy(&source)))
             .into_diagnostic()?;
 
         let tree = tree_with_errors
