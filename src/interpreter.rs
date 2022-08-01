@@ -1,13 +1,11 @@
 use std::{
-    collections::HashMap,
-    fmt, fs,
-    io::Read,
-    ops::Range,
-    path::{Path, PathBuf},
+    fs,
+    io::{self, Read, Write},
+    path::PathBuf,
 };
 
-use ariadne::{Cache, Color, FileCache, Label, Report, ReportKind, Source, Span};
-use miette::{Diagnostic, IntoDiagnostic, LabeledSpan, SourceOffset, SourceSpan};
+use ariadne::{Color, Label, Report, ReportKind, Source};
+use miette::{Diagnostic, IntoDiagnostic, SourceSpan};
 use tree_sitter::{InputEdit, Node, Parser, Point, QueryCursor, Tree, TreeCursor};
 
 use crate::{
@@ -251,19 +249,28 @@ fn execute_match(
             // TODO (opti): instead of re-parsing the tree after every change, try to apply as many changes as possible without overlap before parsing again
             let tree_with_errors = parse_source(parser, &source, None);
 
-            let report: Report = if let (None, _) = &tree_with_errors {
-                Report::build(ReportKind::Error, (), 0)
-                    .with_message("tree-sitter couldn't parse source file")
-                    .finish()
-            } else {
-                Report::build(ReportKind::Warning, (), 0)
-                    .with_message("tree-sitter returned parse errors")
-                    .finish()
-            };
+            {
+                let (tree, reports) = &tree_with_errors;
 
-            report
-                .eprint(Source::from(String::from_utf8_lossy(&source)))
-                .map_err(MatchError::Io)?;
+                if tree.is_none() || reports.len() > 0 {
+                    let report: Report = if tree.is_none() {
+                        Report::build(ReportKind::Error, (), 0)
+                            .with_message("tree-sitter couldn't parse source file")
+                            .finish()
+                    } else {
+                        Report::build(ReportKind::Warning, (), 0)
+                            .with_message(format!(
+                                "tree-sitter returned {} parse errors",
+                                reports.len()
+                            ))
+                            .finish()
+                    };
+
+                    report
+                        .eprint(Source::from(String::from_utf8_lossy(&source)))
+                        .map_err(MatchError::Io)?;
+                }
+            }
 
             *tree = tree_with_errors
                 .print_reports(String::from_utf8_lossy(&source), verbose)
@@ -337,19 +344,28 @@ impl Interpreter {
 
         let tree_with_errors = parse_source(&mut parser, &source, None);
 
-        let report: Report = if let (None, _) = &tree_with_errors {
-            Report::build(ReportKind::Error, (), 0)
-                .with_message("tree-sitter couldn't parse source file")
-                .finish()
-        } else {
-            Report::build(ReportKind::Warning, (), 0)
-                .with_message("tree-sitter returned parse errors")
-                .finish()
-        };
+        {
+            let (tree, reports) = &tree_with_errors;
 
-        report
-            .eprint(Source::from(String::from_utf8_lossy(&source)))
-            .into_diagnostic()?;
+            if tree.is_none() || reports.len() > 0 {
+                let report: Report = if tree.is_none() {
+                    Report::build(ReportKind::Error, (), 0)
+                        .with_message("tree-sitter couldn't parse source file")
+                        .finish()
+                } else {
+                    Report::build(ReportKind::Warning, (), 0)
+                        .with_message(format!(
+                            "tree-sitter returned {} parse errors",
+                            reports.len()
+                        ))
+                        .finish()
+                };
+
+                report
+                    .eprint(Source::from(String::from_utf8_lossy(&source)))
+                    .into_diagnostic()?;
+            }
+        }
 
         let tree = tree_with_errors
             .print_reports(String::from_utf8_lossy(&source), verbose)
@@ -389,7 +405,7 @@ impl Interpreter {
             )?
         }
 
-        print!("{}", String::from_utf8(self.source).into_diagnostic()?);
+        io::stdout().write(&self.source).into_diagnostic()?;
 
         Ok(())
     }
