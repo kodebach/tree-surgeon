@@ -1,11 +1,12 @@
 use std::{
     fs,
     io::{self, Read, Write},
+    ops::Range,
     path::PathBuf,
 };
 
-use ariadne::{Color, Label, Report, ReportKind, Source};
-use miette::{Diagnostic, IntoDiagnostic, SourceSpan};
+use ariadne::{Cache, Color, Label, Report, ReportKind, Source, Span};
+use miette::{Diagnostic, IntoDiagnostic, NamedSource, SourceSpan};
 use tree_sitter::{InputEdit, Node, Parser, Point, QueryCursor, Tree, TreeCursor};
 
 use crate::{
@@ -16,13 +17,64 @@ use crate::{
     single::{Single, SingleError},
 };
 
+struct SourceCache {
+    bytes: Vec<u8>,
+    src: Source,
+    file: PathBuf,
+}
+
+impl SourceCache {
+    fn new(bytes: Vec<u8>, file: PathBuf) -> SourceCache {
+        SourceCache {
+            src: Source::from(String::from_utf8_lossy(&bytes)),
+            bytes,
+            file,
+        }
+    }
+
+    fn update<F>(&mut self, update_fn: F)
+    where
+        F: FnOnce(&mut Vec<u8>),
+    {
+        update_fn(&mut self.bytes);
+        self.src = Source::from(String::from_utf8_lossy(&self.bytes));
+    }
+}
+
+impl Cache<PathBuf> for SourceCache {
+    fn fetch(&mut self, id: &PathBuf) -> Result<&Source, Box<dyn std::fmt::Debug + '_>> {
+        if id == &self.file {
+            Ok(&self.src)
+        } else {
+            Err(Box::new(format!(
+                "Failed to fetch source '{}'",
+                id.display()
+            )))
+        }
+    }
+
+    fn display<'a>(&self, id: &'a PathBuf) -> Option<Box<dyn std::fmt::Display + 'a>> {
+        Some(Box::new(id.display()))
+    }
+}
+
+type FileSpan = (PathBuf, Range<usize>);
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum LogLevel {
+    Advice,
+    Warning,
+    Error,
+    None,
+}
+
 pub struct Interpreter {
-    source_file: PathBuf,
-    source: Vec<u8>,
+    cache: SourceCache,
     tree: Tree,
     script: Script,
     parser: Parser,
-    verbose: bool,
+    log_level: LogLevel,
+    in_place: bool,
 }
 
 #[derive(Diagnostic, Debug, thiserror::Error)]
@@ -69,7 +121,7 @@ enum ReplacementError {
 #[diagnostic(code(tree_surgeon::script::replace::edit_in_error))]
 struct EditInErrorNode {
     #[source_code]
-    src: String,
+    src: NamedSource,
     error_label: String,
     #[label("{error_label}")]
     error_span: SourceSpan,
@@ -91,36 +143,56 @@ struct ScriptParseError {
     script_file: PathBuf,
 }
 
-struct TreeErrorIter<'a>(TreeCursor<'a>);
+trait TreeCusorExt {
+    fn error_iter(&self) -> TreeErrorIter;
+}
+
+impl<'a> TreeCusorExt for TreeCursor<'a> {
+    fn error_iter(&self) -> TreeErrorIter {
+        TreeErrorIter {
+            cursor: self.clone(),
+            next_node: Some(self.node()),
+        }
+    }
+}
+
+struct TreeErrorIter<'a> {
+    cursor: TreeCursor<'a>,
+    next_node: Option<Node<'a>>,
+}
 
 impl<'a> Iterator for TreeErrorIter<'a> {
     type Item = Node<'a>;
 
-    fn next(&mut self) -> Option<Self::Item> {
-        fn goto_next(cursor: &mut TreeCursor) -> bool {
-            while !cursor.goto_next_sibling() {
-                if !cursor.goto_parent() {
-                    return false;
+    fn next<'b>(&'b mut self) -> Option<Self::Item> {
+        fn goto_next<'a>(iter: &mut TreeErrorIter<'a>) {
+            while !iter.cursor.goto_next_sibling() {
+                if !iter.cursor.goto_parent() {
+                    iter.next_node = None;
+                    return;
                 }
             }
 
-            true
+            iter.next_node = Some(iter.cursor.node());
         }
 
         loop {
-            let node = self.0.node();
+            let node = if let Some(node) = self.next_node {
+                node
+            } else {
+                break;
+            };
+
             if node.is_error() {
-                goto_next(&mut self.0);
+                goto_next(self);
                 return Some(node);
             } else {
-                if self.0.goto_first_child() {
+                if self.cursor.goto_first_child() {
                     continue;
                 }
             }
 
-            if !goto_next(&mut self.0) {
-                break;
-            }
+            goto_next(self);
         }
 
         None
@@ -129,42 +201,71 @@ impl<'a> Iterator for TreeErrorIter<'a> {
 
 fn parse_source(
     parser: &mut Parser,
-    source: &Vec<u8>,
+    bytes: &Vec<u8>,
+    file: &PathBuf,
+    log_level: LogLevel,
     old_tree: Option<&Tree>,
-) -> (Option<Tree>, Vec<Report>) {
-    let tree = parser.parse(source, old_tree);
+) -> (Option<Tree>, Vec<Report<FileSpan>>) {
+    let tree = parser.parse(bytes, old_tree);
 
     if let Some(tree) = tree {
-        let error_iter = TreeErrorIter(tree.walk());
+        let mut errors: Vec<_> = if log_level <= LogLevel::Advice {
+            let cursor = tree.walk();
+            let error_iter = cursor.error_iter();
 
-        let errors = error_iter
-            .map(|node| {
-                let parent = node.parent().unwrap_or(node);
-                Report::build(ReportKind::Advice, (), node.start_byte())
-                    .with_message("tree-sitter couldn't parse code fragment")
-                    .with_label(Label::new(parent.byte_range()).with_message(parent.to_sexp()))
-                    .with_label(
-                        Label::new(node.byte_range())
-                            .with_message(node.to_sexp())
-                            .with_color(Color::Red),
-                    )
-                    .finish()
-            })
-            .collect();
+            error_iter
+                .map(|node| {
+                    let parent = node.parent().unwrap_or(node);
+                    Report::build(ReportKind::Advice, file.clone(), node.start_byte())
+                        .with_message("tree-sitter couldn't parse code fragment")
+                        .with_label(
+                            Label::new((file.clone(), parent.byte_range()))
+                                .with_message(parent.to_sexp()),
+                        )
+                        .with_label(
+                            Label::new((file.clone(), node.byte_range()))
+                                .with_message(node.to_sexp())
+                                .with_color(Color::Red),
+                        )
+                        .finish()
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        if log_level <= LogLevel::Warning && errors.len() > 0 {
+            errors.insert(
+                0,
+                Report::build(ReportKind::Warning, file.clone(), 0)
+                    .with_message(format!(
+                        "tree-sitter returned {} parse errors",
+                        errors.len()
+                    ))
+                    .finish(),
+            )
+        }
 
         (Some(tree), errors)
     } else {
-        (None, Vec::new())
+        if log_level <= LogLevel::Error {
+            let error = Report::build(ReportKind::Error, file.clone(), 0)
+                .with_message("tree-sitter couldn't parse source file")
+                .finish();
+
+            (None, vec![error])
+        } else {
+            (None, Vec::new())
+        }
     }
 }
 
 fn execute_match(
     m: &Match,
     parser: &mut Parser,
-    source_file: &PathBuf,
-    source: &mut Vec<u8>,
+    cache: &mut SourceCache,
     tree: &mut Tree,
-    verbose: bool,
+    log_level: LogLevel,
 ) -> Result<(), MatchError> {
     fn error_ancestor(node: Node) -> Option<Node> {
         if let Some(parent) = node.parent() {
@@ -184,7 +285,7 @@ fn execute_match(
 
     loop {
         let old_tree = tree.clone();
-        let old_source = source.clone();
+        let old_source = cache.bytes.clone();
 
         let mut matches = cursor.matches(&query, old_tree.root_node(), old_source.as_slice());
 
@@ -216,7 +317,10 @@ fn execute_match(
                 let error_end_byte = error.end_byte();
 
                 return Err(MatchError::EditInErrorNode(EditInErrorNode {
-                    src: String::from_utf8(source.clone()).map_err(MatchError::Utf8)?,
+                    src: NamedSource::new(
+                        cache.file.to_string_lossy(),
+                        String::from_utf8(cache.bytes.clone()).map_err(MatchError::Utf8)?,
+                    ),
                     error_span: (error_start_byte, error_end_byte - error_start_byte).into(),
                     error_label: error.to_sexp(),
                     edit_span: (start_byte, old_end_byte - start_byte).into(),
@@ -242,42 +346,19 @@ fn execute_match(
                 },
             };
 
-            source.splice(edit.start_byte..edit.old_end_byte, replacement.bytes());
+            cache.update(|bytes| {
+                bytes.splice(edit.start_byte..edit.old_end_byte, replacement.bytes());
+            });
 
             tree.edit(&edit);
 
             // TODO (opti): instead of re-parsing the tree after every change, try to apply as many changes as possible without overlap before parsing again
-            let tree_with_errors = parse_source(parser, &source, None);
-
-            {
-                let (tree, reports) = &tree_with_errors;
-
-                if tree.is_none() || reports.len() > 0 {
-                    let report: Report = if tree.is_none() {
-                        Report::build(ReportKind::Error, (), 0)
-                            .with_message("tree-sitter couldn't parse source file")
-                            .finish()
-                    } else {
-                        Report::build(ReportKind::Warning, (), 0)
-                            .with_message(format!(
-                                "tree-sitter returned {} parse errors",
-                                reports.len()
-                            ))
-                            .finish()
-                    };
-
-                    report
-                        .eprint(Source::from(String::from_utf8_lossy(&source)))
-                        .map_err(MatchError::Io)?;
-                }
-            }
-
-            *tree = tree_with_errors
-                .print_reports(String::from_utf8_lossy(&source), verbose)
+            *tree = parse_source(parser, &cache.bytes, &cache.file, log_level, Some(tree))
+                .print_reports(cache)
                 .map_err(MatchError::Io)?
                 .ok_or(MatchError::Replacement(ReplacementError::TreeParse(
                     TreeParseError {
-                        source_file: source_file.to_owned(),
+                        source_file: cache.file.to_owned(),
                     },
                 )))?;
         } else {
@@ -289,28 +370,38 @@ fn execute_match(
 fn execute_statement(
     statement: &Statement,
     parser: &mut Parser,
-    source_file: &PathBuf,
-    source: &mut Vec<u8>,
+    cache: &mut SourceCache,
     tree: &mut Tree,
-    verbose: bool,
+    log_level: LogLevel,
 ) -> Result<(), StatementError> {
     match statement {
-        Statement::Match(m) => execute_match(m, parser, source_file, source, tree, verbose)
-            .map_err(StatementError::Match),
+        Statement::Match(m) => {
+            execute_match(m, parser, cache, tree, log_level).map_err(StatementError::Match)
+        }
         Statement::Invalid => Err(StatementError::Invalid),
     }
 }
 
-trait ParseResult<T, S> {
-    fn print_reports(self, source: S, verbose: bool) -> std::io::Result<T>;
+trait ParseResult<C, S>
+where
+    C: Cache<S::SourceId>,
+    S: Span,
+{
+    type Data;
+
+    fn print_reports(self, cache: &mut C) -> std::io::Result<Self::Data>;
 }
 
-impl<'a, T, S: AsRef<str>> ParseResult<T, S> for (T, Vec<Report>) {
-    fn print_reports(self, source: S, verbose: bool) -> std::io::Result<T> {
-        if verbose {
-            for report in &self.1 {
-                report.eprint(Source::from(&source))?;
-            }
+impl<'a, T, C, S> ParseResult<C, S> for (Option<T>, Vec<Report<S>>)
+where
+    C: Cache<S::SourceId>,
+    S: Span,
+{
+    type Data = Option<T>;
+
+    fn print_reports(self, cache: &mut C) -> std::io::Result<Self::Data> {
+        for report in &self.1 {
+            report.write(&mut *cache, io::stderr())?;
         }
 
         Ok(self.0)
@@ -321,7 +412,8 @@ impl Interpreter {
     pub fn new(
         source_file: PathBuf,
         script_file: Option<PathBuf>,
-        verbose: bool,
+        log_level: LogLevel,
+        in_place: bool,
     ) -> miette::Result<Interpreter> {
         let mut parser = Parser::new();
         parser
@@ -342,54 +434,31 @@ impl Interpreter {
 
         let source = fs::read(&source_file).into_diagnostic()?;
 
-        let tree_with_errors = parse_source(&mut parser, &source, None);
+        let mut cache = SourceCache::new(source, source_file);
 
-        {
-            let (tree, reports) = &tree_with_errors;
-
-            if tree.is_none() || reports.len() > 0 {
-                let report: Report = if tree.is_none() {
-                    Report::build(ReportKind::Error, (), 0)
-                        .with_message("tree-sitter couldn't parse source file")
-                        .finish()
-                } else {
-                    Report::build(ReportKind::Warning, (), 0)
-                        .with_message(format!(
-                            "tree-sitter returned {} parse errors",
-                            reports.len()
-                        ))
-                        .finish()
-                };
-
-                report
-                    .eprint(Source::from(String::from_utf8_lossy(&source)))
-                    .into_diagnostic()?;
-            }
-        }
-
-        let tree = tree_with_errors
-            .print_reports(String::from_utf8_lossy(&source), verbose)
+        let tree = parse_source(&mut parser, &cache.bytes, &cache.file, log_level, None)
+            .print_reports(&mut cache)
             .into_diagnostic()?
             .ok_or(TreeParseError {
-                source_file: source_file.to_owned(),
+                source_file: cache.file.to_owned(),
             })
             .into_diagnostic()?;
 
+        let script_file = script_file.unwrap_or(PathBuf::from("<stdin>"));
+
         let script = Script::parse(&script_source, tree.language())
-            .print_reports(&script_source, verbose)
+            .print_reports(&mut Source::from(&script_source))
             .into_diagnostic()?
-            .ok_or(ScriptParseError {
-                script_file: script_file.unwrap_or(PathBuf::from("<stdin>")),
-            })
+            .ok_or(ScriptParseError { script_file })
             .into_diagnostic()?;
 
         Ok(Interpreter {
-            source,
-            source_file,
+            cache,
             tree,
             script,
             parser,
-            verbose,
+            log_level,
+            in_place,
         })
     }
 
@@ -398,14 +467,17 @@ impl Interpreter {
             execute_statement(
                 statement,
                 &mut self.parser,
-                &self.source_file,
-                &mut self.source,
+                &mut self.cache,
                 &mut self.tree,
-                self.verbose,
+                self.log_level,
             )?
         }
 
-        io::stdout().write(&self.source).into_diagnostic()?;
+        if self.in_place {
+            fs::write(&self.cache.file, &self.cache.bytes).into_diagnostic()?;
+        } else {
+            io::stdout().write(&self.cache.bytes).into_diagnostic()?;
+        }
 
         Ok(())
     }
