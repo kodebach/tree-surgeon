@@ -7,11 +7,14 @@ use std::{
 
 use ariadne::{Cache, Color, Label, Report, ReportKind, Source, Span};
 use miette::{Diagnostic, IntoDiagnostic, NamedSource, SourceSpan};
-use tree_sitter::{InputEdit, Node, Parser, Point, QueryCursor, Tree, TreeCursor};
+use tree_sitter::{
+    InputEdit, Node, Parser, Point, Query, QueryCursor, QueryMatch, QueryPredicateArg, Tree,
+    TreeCursor,
+};
 
 use crate::{
     dsl::{
-        ast::{Match, Script, Statement},
+        ast::{JoinItem, Match, Replacement, Script, Statement},
         parser::Parsable,
     },
     single::{Single, SingleError},
@@ -103,7 +106,10 @@ enum MatchError {
     Io(#[from] std::io::Error),
     #[error(transparent)]
     #[diagnostic(code(tree_surgeon::string::from_utf8))]
-    Utf8(#[from] std::string::FromUtf8Error),
+    FromUtf8(#[from] std::string::FromUtf8Error),
+    #[error(transparent)]
+    #[diagnostic(code(tree_surgeon::string::utf8))]
+    Utf8(#[from] std::str::Utf8Error),
 }
 
 #[derive(Diagnostic, Debug, thiserror::Error)]
@@ -260,6 +266,25 @@ fn parse_source(
     }
 }
 
+fn get_capture_node<'a>(
+    query: &'a Query,
+    query_match: &'a QueryMatch,
+    capture_name: &'a str,
+) -> Result<Node<'a>, MatchError> {
+    let capture_index = if let Some(capture_index) = query.capture_index_for_name(capture_name) {
+        capture_index
+    } else {
+        return Err(MatchError::Replacement(ReplacementError::MissingCapture {
+            capture_name: capture_name.to_string(),
+        }));
+    };
+
+    query_match
+        .nodes_for_capture_index(capture_index)
+        .single()
+        .map_err(MatchError::Single)
+}
+
 fn execute_match(
     m: &Match,
     parser: &mut Parser,
@@ -287,25 +312,75 @@ fn execute_match(
         let old_tree = tree.clone();
         let old_source = cache.bytes.clone();
 
-        let mut matches = cursor.matches(&query, old_tree.root_node(), old_source.as_slice());
+        let mut matches = cursor
+            .matches(&query, old_tree.root_node(), old_source.as_slice())
+            .filter(|query_match| {
+                query
+                    .general_predicates(query_match.pattern_index)
+                    .iter()
+                    .all(|predicate| {
+                        let invert: bool;
+                        let name = if predicate.operator.starts_with("not-") {
+                            invert = true;
+                            &predicate.operator[4..]
+                        } else {
+                            invert = false;
+                            &predicate.operator
+                        };
+
+                        let result = match name {
+                            "in-list?" => {
+                                if predicate.args.len() < 2 {
+                                    eprintln!("Too few args");
+                                    return false; // TODO: error
+                                }
+
+                                if let QueryPredicateArg::Capture(capture) = predicate.args[0] {
+                                    let strings: Vec<&str> = predicate.args[1..]
+                                        .iter()
+                                        .filter_map(|arg| {
+                                            if let QueryPredicateArg::String(s) = arg {
+                                                Some(s.as_ref())
+                                            } else {
+                                                None
+                                            }
+                                        })
+                                        .collect();
+
+                                    if strings.len() + 1 != predicate.args.len() {
+                                        eprintln!("rest not all strings");
+                                        return false; // TODO: error
+                                    }
+
+                                    let node = query_match
+                                        .nodes_for_capture_index(capture)
+                                        .single()
+                                        .unwrap(); // TODO: error
+
+                                    let node_text = node.utf8_text(&old_source).unwrap(); // TODO: error
+
+                                    strings.contains(&node_text)
+                                } else {
+                                    eprintln!("first not capture");
+                                    false // TODO: error
+                                }
+                            }
+                            s => {
+                                // TODO: report error
+                                eprintln!("unknown predicate {}", s); 
+                                false
+                            }
+                        };
+
+                        invert ^ result
+                    })
+            });
 
         if let Some(query_match) = matches.next() {
-            let capture_name = m.replacement().capture_name();
-            let replacement = m.replacement().replacement();
+            let replacement = m.replacement();
+            let capture_name = replacement.capture_name();
 
-            let capture_index =
-                if let Some(capture_index) = query.capture_index_for_name(capture_name) {
-                    capture_index
-                } else {
-                    return Err(MatchError::Replacement(ReplacementError::MissingCapture {
-                        capture_name: capture_name.to_string(),
-                    }));
-                };
-
-            let node = query_match
-                .nodes_for_capture_index(capture_index)
-                .single()
-                .map_err(MatchError::Single)?;
+            let node = get_capture_node(query, &query_match, capture_name)?;
 
             let start_byte = node.start_byte();
             let old_end_byte = node.end_byte();
@@ -319,7 +394,7 @@ fn execute_match(
                 return Err(MatchError::EditInErrorNode(EditInErrorNode {
                     src: NamedSource::new(
                         cache.file.to_string_lossy(),
-                        String::from_utf8(cache.bytes.clone()).map_err(MatchError::Utf8)?,
+                        String::from_utf8(cache.bytes.clone()).map_err(MatchError::FromUtf8)?,
                     ),
                     error_span: (error_start_byte, error_end_byte - error_start_byte).into(),
                     error_label: error.to_sexp(),
@@ -327,19 +402,33 @@ fn execute_match(
                 }));
             }
 
-            let line_ending_count = replacement.chars().filter(|c| *c == '\n').count();
-            let last_line_len = replacement.chars().rev().take_while(|c| *c != '\n').count();
+            let new_text = match &replacement.replacement() {
+                Replacement::Literal(new_text) => new_text.clone(),
+                Replacement::Join(items) => items
+                    .iter()
+                    .map(|item| match item {
+                        JoinItem::CaptureName(capture_name) => {
+                            get_capture_node(query, &query_match, capture_name)
+                                .and_then(|n| n.utf8_text(&old_source).map_err(MatchError::Utf8))
+                        }
+                        JoinItem::Literal(new_text) => Ok(new_text.as_ref()),
+                    })
+                    .collect::<Result<String, _>>()?,
+            };
+
+            let line_ending_count = new_text.chars().filter(|c| *c == '\n').count();
+            let last_line_len = new_text.chars().rev().take_while(|c| *c != '\n').count();
 
             let edit = InputEdit {
                 start_byte,
                 old_end_byte,
                 start_position,
                 old_end_position,
-                new_end_byte: start_byte + replacement.len(),
+                new_end_byte: start_byte + new_text.len(),
                 new_end_position: Point {
                     row: start_position.row + line_ending_count,
                     column: if line_ending_count == 0 {
-                        start_position.column + replacement.len()
+                        start_position.column + new_text.len()
                     } else {
                         last_line_len
                     },
@@ -347,7 +436,7 @@ fn execute_match(
             };
 
             cache.update(|bytes| {
-                bytes.splice(edit.start_byte..edit.old_end_byte, replacement.bytes());
+                bytes.splice(edit.start_byte..edit.old_end_byte, new_text.bytes());
             });
 
             tree.edit(&edit);

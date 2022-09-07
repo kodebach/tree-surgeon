@@ -11,13 +11,25 @@ pub struct Script {
 #[derive(Debug)]
 pub struct Match {
     query: Query,
+    replacement: Replace,
+}
+
+#[derive(Debug)]
+pub struct Replace {
+    capture_name: String,
     replacement: Replacement,
 }
 
 #[derive(Debug)]
-pub struct Replacement {
-    capture_name: String,
-    replacement: String,
+pub enum Replacement {
+    Literal(String),
+    Join(Vec<JoinItem>),
+}
+
+#[derive(Debug)]
+pub enum JoinItem {
+    CaptureName(String),
+    Literal(String),
 }
 
 #[derive(Debug)]
@@ -26,22 +38,22 @@ pub enum Statement {
     Invalid,
 }
 
-impl Replacement {
-    pub fn new(capture_name: String, replacement: String) -> Replacement {
-        Replacement { capture_name, replacement }
+impl Replace {
+    pub fn new(capture_name: String, replacement: Replacement) -> Replace {
+        Replace { capture_name, replacement }
     }
 
-    pub fn capture_name<'a>(self: &'a Self) -> &'a str {
+    pub fn capture_name<'a>(&'a self) -> &'a str {
         &self.capture_name
     }
 
-    pub fn replacement<'a>(self: &'a Self) -> &'a str {
+    pub fn replacement<'a>(&'a self) -> &'a Replacement {
         &self.replacement
     }
 }
 
 impl Match {
-    pub fn new(query: Query, replacement: Replacement) -> Match {
+    pub fn new(query: Query, replacement: Replace) -> Match {
         Match { query, replacement }
     }
 
@@ -49,7 +61,7 @@ impl Match {
         &self.query
     }
 
-    pub fn replacement<'a>(self: &'a Self) -> &'a Replacement {
+    pub fn replacement<'a>(self: &'a Self) -> &'a Replace {
         &self.replacement
     }
 }

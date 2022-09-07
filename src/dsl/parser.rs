@@ -5,7 +5,7 @@ use ariadne::{Color, Fmt, Label, Report, ReportKind};
 use chumsky::{prelude::*, text::Character, Stream};
 use tree_sitter::{Language, Query as TsQuery};
 
-use super::ast::{Match, Replacement, Script, Span, Statement};
+use super::ast::{JoinItem, Match, Replace, Replacement, Script, Span, Statement};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum Token {
@@ -30,6 +30,7 @@ impl fmt::Display for Token {
                 Keyword::Match => write!(f, "match"),
                 Keyword::Replace => write!(f, "replace"),
                 Keyword::With => write!(f, "with"),
+                Keyword::By => write!(f, "by"),
             },
             Token::Ctrl(c) => write!(f, "{}", c),
         }
@@ -41,6 +42,7 @@ enum Keyword {
     Match,
     Replace,
     With,
+    By,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -293,20 +295,21 @@ fn lexer() -> impl Parser<char, Vec<(Token, Span)>, Error = Simple<char>> {
     let keyword = choice((
         just("match").to(Keyword::Match).labelled("match"),
         just("replace").to(Keyword::Replace).labelled("replace"),
+        just("by").to(Keyword::By).labelled("by"),
         just("with").to(Keyword::With).labelled("with"),
     ))
     .labelled("keyword")
     .map(Token::Keyword);
 
     let capture = just("@")
-        .ignore_then(filter(|c: &char| !c.is_whitespace() && *c != '(' && *c != ')').repeated())
+        .ignore_then(filter(|c: &char| !c.is_whitespace() && *c != '(' && *c != ')' && *c != '[' && *c != ']').repeated())
         .collect::<String>()
         .map(Capture)
         .labelled("capture")
         .map(Token::Capture);
 
     let predicate_name = just("#")
-        .ignore_then(filter(|c: &char| !c.is_whitespace() && *c != '(' && *c != ')').repeated())
+        .ignore_then(filter(|c: &char| !c.is_whitespace() && *c != '(' && *c != ')' && *c != '[' && *c != ']').repeated())
         .collect::<String>()
         .map(PredicateName)
         .labelled("predicate name")
@@ -372,7 +375,7 @@ struct DslParser {
 }
 
 impl DslParser {
-    fn replacement(&self) -> impl Parser<Token, Replacement, Error = Simple<Token>> + Clone {
+    fn replacement(&self) -> impl Parser<Token, Replace, Error = Simple<Token>> + Clone {
         let capture = filter_map(|span, tok| match tok {
             Token::Capture(name) => Ok(name.clone()),
             _ => Err(Simple::expected_input_found(
@@ -391,13 +394,26 @@ impl DslParser {
             )),
         });
 
+        let literal_replace = just(Token::Keyword(Keyword::With))
+            .then(str_.labelled("replacement literal"))
+            .map(|(_, literal)| Replacement::Literal(literal.0));
+
+        let join_replace = just(Token::Keyword(Keyword::By))
+            .then(
+                choice((
+                    str_.map(|str| JoinItem::Literal(str.0)),
+                    capture.map(|capture| JoinItem::CaptureName(capture.0)),
+                ))
+                .repeated()
+                .delimited_by(just(Token::Ctrl('[')), just(Token::Ctrl(']')))
+                .labelled("replacement expression"),
+            )
+            .map(|(_, items)| Replacement::Join(items));
+
         just(Token::Keyword(Keyword::Replace))
             .then(capture.labelled("capture reference"))
-            .then(just(Token::Keyword(Keyword::With)))
-            .then(str_.labelled("replacement literal"))
-            .map(|(((_, capture_name), _), replacement)| {
-                Replacement::new(capture_name.0, replacement.0)
-            })
+            .then(choice((literal_replace, join_replace)))
+            .map(|((_, capture), replacement)| Replace::new(capture.0, replacement))
     }
 
     fn query(&self) -> impl Parser<Token, Query, Error = Simple<Token>> + Clone {
