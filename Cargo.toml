@@ -10,8 +10,10 @@ anyhow = "1.0.57"
 ariadne = "0.1.5"
 chumsky = "0.8.0"
 clap = { version = "3.2.2", features = ["derive"] }
+convert_case = "0.6.0"
 derive_more = "0.99.17"
 miette = { version = "4.7.1", features = ["fancy"] }
+strum = { version = "0.24.1", features = ["derive"] }
 thiserror = "1.0.31"
 tree-sitter = "0.20.6"
 tree-sitter-c = { path = "tree-sitter-c", version = "0.20.1" }

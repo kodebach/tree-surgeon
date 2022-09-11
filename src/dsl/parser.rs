@@ -3,9 +3,12 @@ use std::fmt;
 use ariadne::{Color, Fmt, Label, Report, ReportKind};
 
 use chumsky::{prelude::*, text::Character, Stream};
+use strum::IntoEnumIterator;
 use tree_sitter::{Language, Query as TsQuery};
 
-use super::ast::{JoinItem, Match, Replace, Replacement, Script, Span, Statement};
+use super::ast::{
+    CaptureExpr, Case, JoinItem, Match, Replace, Replacement, Script, Span, Statement,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum Token {
@@ -290,7 +293,7 @@ fn lexer() -> impl Parser<char, Vec<(Token, Span)>, Error = Simple<char>> {
         .map(Token::Str)
         .labelled("string");
 
-    let ctrl = one_of(";()[]:.+?!").map(Token::Ctrl);
+    let ctrl = one_of(";()[]:.+?!$").map(Token::Ctrl);
 
     let keyword = choice((
         just("match").to(Keyword::Match).labelled("match"),
@@ -302,14 +305,24 @@ fn lexer() -> impl Parser<char, Vec<(Token, Span)>, Error = Simple<char>> {
     .map(Token::Keyword);
 
     let capture = just("@")
-        .ignore_then(filter(|c: &char| !c.is_whitespace() && *c != '(' && *c != ')' && *c != '[' && *c != ']').repeated())
+        .ignore_then(
+            filter(|c: &char| {
+                !c.is_whitespace() && *c != '(' && *c != ')' && *c != '[' && *c != ']' && *c != '$'
+            })
+            .repeated(),
+        )
         .collect::<String>()
         .map(Capture)
         .labelled("capture")
         .map(Token::Capture);
 
     let predicate_name = just("#")
-        .ignore_then(filter(|c: &char| !c.is_whitespace() && *c != '(' && *c != ')' && *c != '[' && *c != ']').repeated())
+        .ignore_then(
+            filter(|c: &char| {
+                !c.is_whitespace() && *c != '(' && *c != ')' && *c != '[' && *c != ']'
+            })
+            .repeated(),
+        )
         .collect::<String>()
         .map(PredicateName)
         .labelled("predicate name")
@@ -398,11 +411,56 @@ impl DslParser {
             .then(str_.labelled("replacement literal"))
             .map(|(_, literal)| Replacement::Literal(literal.0));
 
+        let recase_ident = filter_map(move |span, tok| match tok {
+            Token::Ident(ident) => Ok(ident.0),
+            _ => Err(Simple::expected_input_found(
+                span,
+                Case::iter().map(|case| Some(Token::Ident(Ident(case.as_ref().to_owned())))),
+                Some(tok),
+            )),
+        })
+        .from_str::<Case>()
+        .try_map(|res, span| res.map_err(|e| Simple::custom(span, e.to_string())));
+
+        let recase_suffix = just(Token::Ctrl('$'))
+            .then(recase_ident)
+            .map(|(_, case)| case)
+            .labelled("recase suffix");
+
+        let index = filter_map(|span, tok| match tok {
+            Token::Num(ref num) => num
+                .parse::<usize>()
+                .map_err(|e| Simple::custom(span, e.to_string())),
+            _ => Err(Simple::expected_input_found(
+                span,
+                vec![Some(Token::Num(String::from("123")))],
+                Some(tok),
+            )),
+        })
+        .labelled("index");
+
+        let range_suffix = index
+            .or_not()
+            .then(just(Token::Ctrl(':')))
+            .then(index.or_not())
+            .delimited_by(just(Token::Ctrl('[')), just(Token::Ctrl(']')))
+            .labelled("index range");
+
+        let capture_expr = capture
+            .then(recase_suffix.or_not())
+            .then(range_suffix.or_not());
+
         let join_replace = just(Token::Keyword(Keyword::By))
             .then(
                 choice((
                     str_.map(|str| JoinItem::Literal(str.0)),
-                    capture.map(|capture| JoinItem::CaptureName(capture.0)),
+                    capture_expr.map(|((capture, case), range)| {
+                        if let Some(((from, _), to)) = range {
+                            JoinItem::CaptureExpr(CaptureExpr::new(capture.0, case, Some(from..to)))
+                        } else {
+                            JoinItem::CaptureExpr(CaptureExpr::new(capture.0, case, None))
+                        }
+                    }),
                 ))
                 .repeated()
                 .delimited_by(just(Token::Ctrl('[')), just(Token::Ctrl(']')))

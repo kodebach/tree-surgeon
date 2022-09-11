@@ -6,6 +6,7 @@ use std::{
 };
 
 use ariadne::{Cache, Color, Label, Report, ReportKind, Source, Span};
+use convert_case::Casing;
 use miette::{Diagnostic, IntoDiagnostic, NamedSource, SourceSpan};
 use tree_sitter::{
     InputEdit, Node, Parser, Point, Query, QueryCursor, QueryMatch, QueryPredicateArg, Tree,
@@ -367,7 +368,7 @@ fn execute_match(
                             }
                             s => {
                                 // TODO: report error
-                                eprintln!("unknown predicate {}", s); 
+                                eprintln!("unknown predicate {}", s);
                                 false
                             }
                         };
@@ -407,11 +408,24 @@ fn execute_match(
                 Replacement::Join(items) => items
                     .iter()
                     .map(|item| match item {
-                        JoinItem::CaptureName(capture_name) => {
-                            get_capture_node(query, &query_match, capture_name)
+                        JoinItem::CaptureExpr(capture_expr) => {
+                            get_capture_node(query, &query_match, capture_expr.capture_name())
                                 .and_then(|n| n.utf8_text(&old_source).map_err(MatchError::Utf8))
+                                .map(|text| {
+                                    capture_expr
+                                        .target_case()
+                                        .map_or(text.to_owned(), |case| text.to_case(case.into()))
+                                })
+                                .map(|text| {
+                                    capture_expr
+                                        .range()
+                                        .map(|Range { start, end }| {
+                                            start.unwrap_or(0)..end.unwrap_or(text.len())
+                                        })
+                                        .map_or(text.to_owned(), |range| (&text[range]).to_owned())
+                                })
                         }
-                        JoinItem::Literal(new_text) => Ok(new_text.as_ref()),
+                        JoinItem::Literal(new_text) => Ok(new_text.to_owned()),
                     })
                     .collect::<Result<String, _>>()?,
             };

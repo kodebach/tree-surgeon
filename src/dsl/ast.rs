@@ -1,7 +1,33 @@
+use std::ops::Range;
+
+use strum::{EnumIter, EnumString, AsRefStr};
 use tree_sitter::Query;
 
 pub type Span = std::ops::Range<usize>;
 pub type Spanned<T> = (T, Span);
+
+#[derive(Eq, PartialEq, Hash, Clone, Copy, Debug, EnumIter, EnumString, AsRefStr)]
+pub enum Case {
+    Camel,
+    UpperCamel,
+    Snake,
+    UpperSnake,
+    Kebab,
+    UpperKebab,
+}
+
+impl From<Case> for convert_case::Case {
+    fn from(case: Case) -> Self {
+        match case {
+            Case::Camel => convert_case::Case::Camel,
+            Case::UpperCamel => convert_case::Case::UpperCamel,
+            Case::Snake => convert_case::Case::Snake,
+            Case::UpperSnake => convert_case::Case::UpperSnake,
+            Case::Kebab => convert_case::Case::Kebab,
+            Case::UpperKebab => convert_case::Case::UpperKebab,
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct Script {
@@ -28,8 +54,15 @@ pub enum Replacement {
 
 #[derive(Debug)]
 pub enum JoinItem {
-    CaptureName(String),
+    CaptureExpr(CaptureExpr),
     Literal(String),
+}
+
+#[derive(Debug)]
+pub struct CaptureExpr {
+    capture_name: String,
+    target_case: Option<Case>,
+    range: Option<Range<Option<usize>>>,
 }
 
 #[derive(Debug)]
@@ -38,9 +71,38 @@ pub enum Statement {
     Invalid,
 }
 
+impl CaptureExpr {
+    pub fn new(
+        capture_name: String,
+        target_case: Option<Case>,
+        range: Option<Range<Option<usize>>>,
+    ) -> CaptureExpr {
+        CaptureExpr {
+            capture_name,
+            target_case,
+            range,
+        }
+    }
+
+    pub fn capture_name(&self) -> &str {
+        self.capture_name.as_ref()
+    }
+
+    pub fn target_case(&self) -> Option<Case> {
+        self.target_case
+    }
+
+    pub fn range(&self) -> Option<&Range<Option<usize>>> {
+        self.range.as_ref()
+    }
+}
+
 impl Replace {
     pub fn new(capture_name: String, replacement: Replacement) -> Replace {
-        Replace { capture_name, replacement }
+        Replace {
+            capture_name,
+            replacement,
+        }
     }
 
     pub fn capture_name<'a>(&'a self) -> &'a str {
