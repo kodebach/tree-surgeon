@@ -2,14 +2,14 @@ use std::{
     fs,
     io::{self, Read, Write},
     ops::Range,
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 use ariadne::{Cache, Color, Label, Report, ReportKind, Source, Span};
 use convert_case::Casing;
 use miette::{Diagnostic, IntoDiagnostic, NamedSource, SourceSpan};
 use tree_sitter::{
-    InputEdit, Node, Parser, Point, Query, QueryCursor, QueryMatch, QueryPredicateArg, Tree,
+    InputEdit, Node, Parser, Point, Query, QueryCapture, QueryCursor, QueryPredicateArg, Tree,
     TreeCursor,
 };
 
@@ -21,19 +21,38 @@ use crate::{
     single::{Single, SingleError},
 };
 
-struct SourceCache {
+trait SourceCache : Cache<PathBuf> {
+    fn bytes(&self) -> &[u8];
+    fn file(&self) -> &Path;
+
+    fn update<F>(&mut self, update_fn: F)
+    where
+        F: FnOnce(&mut Vec<u8>);
+}
+
+struct FileCache {
     bytes: Vec<u8>,
     src: Source,
     file: PathBuf,
 }
 
-impl SourceCache {
-    fn new(bytes: Vec<u8>, file: PathBuf) -> SourceCache {
-        SourceCache {
+impl FileCache {
+    fn new(bytes: Vec<u8>, file: PathBuf) -> FileCache {
+        FileCache {
             src: Source::from(String::from_utf8_lossy(&bytes)),
             bytes,
             file,
         }
+    }
+}
+
+impl SourceCache for FileCache {
+    fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    fn file(&self) -> &Path {
+        &self.file
     }
 
     fn update<F>(&mut self, update_fn: F)
@@ -45,7 +64,7 @@ impl SourceCache {
     }
 }
 
-impl Cache<PathBuf> for SourceCache {
+impl Cache<PathBuf> for FileCache {
     fn fetch(&mut self, id: &PathBuf) -> Result<&Source, Box<dyn std::fmt::Debug + '_>> {
         if id == &self.file {
             Ok(&self.src)
@@ -55,6 +74,49 @@ impl Cache<PathBuf> for SourceCache {
                 id.display()
             )))
         }
+    }
+
+    fn display<'a>(&self, id: &'a PathBuf) -> Option<Box<dyn std::fmt::Display + 'a>> {
+        Some(Box::new(id.display()))
+    }
+}
+
+struct MacroCache<'file> {
+    file_cache: &'file mut FileCache,
+    span: Range<usize>,
+}
+
+impl<'file> MacroCache<'file> {
+    fn new(file_cache: &'file mut FileCache, span: Range<usize>) -> MacroCache<'file> {
+        MacroCache { file_cache, span }
+    }
+}
+
+impl<'file> SourceCache for MacroCache<'file> {
+    fn bytes(&self) -> &[u8] {
+        &self.file_cache.bytes[self.span.clone()]
+    }
+
+    fn file(&self) -> &Path {
+        self.file_cache.file()
+    }
+
+    fn update<F>(&mut self, update_fn: F)
+    where
+        F: FnOnce(&mut Vec<u8>),
+    {
+        let mut macro_bytes = self.bytes().to_vec();
+        update_fn(&mut macro_bytes);
+
+        self.file_cache.update(|bytes| {
+            bytes.splice(self.span.clone(), macro_bytes);
+        });
+    }
+}
+
+impl<'file> Cache<PathBuf> for MacroCache<'file> {
+    fn fetch(&mut self, id: &PathBuf) -> Result<&Source, Box<dyn std::fmt::Debug + '_>> {
+        self.file_cache.fetch(id)
     }
 
     fn display<'a>(&self, id: &'a PathBuf) -> Option<Box<dyn std::fmt::Display + 'a>> {
@@ -73,7 +135,7 @@ pub enum LogLevel {
 }
 
 pub struct Interpreter {
-    cache: SourceCache,
+    cache: FileCache,
     tree: Tree,
     script: Script,
     parser: Parser,
@@ -208,11 +270,12 @@ impl<'a> Iterator for TreeErrorIter<'a> {
 
 fn parse_source(
     parser: &mut Parser,
-    bytes: &Vec<u8>,
-    file: &PathBuf,
+    bytes: &[u8],
+    file: &Path,
     log_level: LogLevel,
     old_tree: Option<&Tree>,
 ) -> (Option<Tree>, Vec<Report<FileSpan>>) {
+    let file = file.to_path_buf();
     let tree = parser.parse(bytes, old_tree);
 
     if let Some(tree) = tree {
@@ -267,11 +330,11 @@ fn parse_source(
     }
 }
 
-fn get_capture_node<'a>(
-    query: &'a Query,
-    query_match: &'a QueryMatch,
-    capture_name: &'a str,
-) -> Result<Node<'a>, MatchError> {
+fn get_capture_node<'tree>(
+    query: &Query,
+    captures: &[QueryCapture<'tree>],
+    capture_name: &str,
+) -> Result<Node<'tree>, MatchError> {
     let capture_index = if let Some(capture_index) = query.capture_index_for_name(capture_name) {
         capture_index
     } else {
@@ -280,8 +343,15 @@ fn get_capture_node<'a>(
         }));
     };
 
-    query_match
-        .nodes_for_capture_index(capture_index)
+    captures
+        .iter()
+        .filter_map(move |capture| {
+            if capture.index == capture_index {
+                Some(capture.node)
+            } else {
+                None
+            }
+        })
         .single()
         .map_err(MatchError::Single)
 }
@@ -289,7 +359,7 @@ fn get_capture_node<'a>(
 fn execute_match(
     m: &Match,
     parser: &mut Parser,
-    cache: &mut SourceCache,
+    cache: &mut impl SourceCache,
     tree: &mut Tree,
     log_level: LogLevel,
 ) -> Result<(), MatchError> {
@@ -307,81 +377,17 @@ fn execute_match(
 
     let query = m.query();
 
-    let mut cursor = QueryCursor::new();
-
     loop {
         let old_tree = tree.clone();
-        let old_source = cache.bytes.clone();
+        let old_source = cache.bytes().to_vec();
 
-        let mut matches = cursor
-            .matches(&query, old_tree.root_node(), old_source.as_slice())
-            .filter(|query_match| {
-                query
-                    .general_predicates(query_match.pattern_index)
-                    .iter()
-                    .all(|predicate| {
-                        let invert: bool;
-                        let name = if predicate.operator.starts_with("not-") {
-                            invert = true;
-                            &predicate.operator[4..]
-                        } else {
-                            invert = false;
-                            &predicate.operator
-                        };
+        let matches = get_matches(query, &old_tree, &old_source);
 
-                        let result = match name {
-                            "in-list?" => {
-                                if predicate.args.len() < 2 {
-                                    eprintln!("Too few args");
-                                    return false; // TODO: error
-                                }
-
-                                if let QueryPredicateArg::Capture(capture) = predicate.args[0] {
-                                    let strings: Vec<&str> = predicate.args[1..]
-                                        .iter()
-                                        .filter_map(|arg| {
-                                            if let QueryPredicateArg::String(s) = arg {
-                                                Some(s.as_ref())
-                                            } else {
-                                                None
-                                            }
-                                        })
-                                        .collect();
-
-                                    if strings.len() + 1 != predicate.args.len() {
-                                        eprintln!("rest not all strings");
-                                        return false; // TODO: error
-                                    }
-
-                                    let node = query_match
-                                        .nodes_for_capture_index(capture)
-                                        .single()
-                                        .unwrap(); // TODO: error
-
-                                    let node_text = node.utf8_text(&old_source).unwrap(); // TODO: error
-
-                                    strings.contains(&node_text)
-                                } else {
-                                    eprintln!("first not capture");
-                                    false // TODO: error
-                                }
-                            }
-                            s => {
-                                // TODO: report error
-                                eprintln!("unknown predicate {}", s);
-                                false
-                            }
-                        };
-
-                        invert ^ result
-                    })
-            });
-
-        if let Some(query_match) = matches.next() {
+        if let Some(query_match) = matches.iter().next() {
             let replacement = m.replacement();
             let capture_name = replacement.capture_name();
 
-            let node = get_capture_node(query, &query_match, capture_name)?;
+            let node = get_capture_node(query, &query_match.captures, capture_name)?;
 
             let start_byte = node.start_byte();
             let old_end_byte = node.end_byte();
@@ -394,8 +400,8 @@ fn execute_match(
 
                 return Err(MatchError::EditInErrorNode(EditInErrorNode {
                     src: NamedSource::new(
-                        cache.file.to_string_lossy(),
-                        String::from_utf8(cache.bytes.clone()).map_err(MatchError::FromUtf8)?,
+                        cache.file().to_string_lossy(),
+                        String::from_utf8(cache.bytes().to_vec()).map_err(MatchError::FromUtf8)?,
                     ),
                     error_span: (error_start_byte, error_end_byte - error_start_byte).into(),
                     error_label: error.to_sexp(),
@@ -408,23 +414,25 @@ fn execute_match(
                 Replacement::Join(items) => items
                     .iter()
                     .map(|item| match item {
-                        JoinItem::CaptureExpr(capture_expr) => {
-                            get_capture_node(query, &query_match, capture_expr.capture_name())
-                                .and_then(|n| n.utf8_text(&old_source).map_err(MatchError::Utf8))
-                                .map(|text| {
-                                    capture_expr
-                                        .target_case()
-                                        .map_or(text.to_owned(), |case| text.to_case(case.into()))
+                        JoinItem::CaptureExpr(capture_expr) => get_capture_node(
+                            query,
+                            &query_match.captures,
+                            capture_expr.capture_name(),
+                        )
+                        .and_then(|n| n.utf8_text(&old_source).map_err(MatchError::Utf8))
+                        .map(|text| {
+                            capture_expr
+                                .target_case()
+                                .map_or(text.to_owned(), |case| text.to_case(case.into()))
+                        })
+                        .map(|text| {
+                            capture_expr
+                                .range()
+                                .map(|Range { start, end }| {
+                                    start.unwrap_or(0)..end.unwrap_or(text.len())
                                 })
-                                .map(|text| {
-                                    capture_expr
-                                        .range()
-                                        .map(|Range { start, end }| {
-                                            start.unwrap_or(0)..end.unwrap_or(text.len())
-                                        })
-                                        .map_or(text.to_owned(), |range| (&text[range]).to_owned())
-                                })
-                        }
+                                .map_or(text.to_owned(), |range| (&text[range]).to_owned())
+                        }),
                         JoinItem::Literal(new_text) => Ok(new_text.to_owned()),
                     })
                     .collect::<Result<String, _>>()?,
@@ -456,12 +464,12 @@ fn execute_match(
             tree.edit(&edit);
 
             // TODO (opti): instead of re-parsing the tree after every change, try to apply as many changes as possible without overlap before parsing again
-            *tree = parse_source(parser, &cache.bytes, &cache.file, log_level, Some(tree))
+            *tree = parse_source(parser, cache.bytes(), cache.file(), log_level, Some(tree))
                 .print_reports(cache)
                 .map_err(MatchError::Io)?
                 .ok_or(MatchError::Replacement(ReplacementError::TreeParse(
                     TreeParseError {
-                        source_file: cache.file.to_owned(),
+                        source_file: cache.file().to_owned(),
                     },
                 )))?;
         } else {
@@ -470,16 +478,124 @@ fn execute_match(
     }
 }
 
+struct QueryMatch<'tree> {
+    captures: Vec<QueryCapture<'tree>>,
+}
+
+fn get_matches<'t>(query: &Query, old_tree: &'t Tree, old_source: &Vec<u8>) -> Vec<QueryMatch<'t>> {
+    let mut cursor = QueryCursor::new();
+
+    cursor
+        .matches(&query, old_tree.root_node(), old_source.as_slice())
+        .filter(|query_match| {
+            query
+                .general_predicates(query_match.pattern_index)
+                .iter()
+                .all(|predicate| {
+                    let invert: bool;
+                    let name = if predicate.operator.starts_with("not-") {
+                        invert = true;
+                        &predicate.operator[4..]
+                    } else {
+                        invert = false;
+                        &predicate.operator
+                    };
+
+                    let result = match name {
+                        "in-list?" => {
+                            if predicate.args.len() < 2 {
+                                eprintln!("Too few args");
+                                return false; // TODO: error
+                            }
+
+                            if let QueryPredicateArg::Capture(capture) = predicate.args[0] {
+                                let strings: Vec<&str> = predicate.args[1..]
+                                    .iter()
+                                    .filter_map(|arg| {
+                                        if let QueryPredicateArg::String(s) = arg {
+                                            Some(s.as_ref())
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .collect();
+
+                                if strings.len() + 1 != predicate.args.len() {
+                                    eprintln!("rest not all strings");
+                                    return false; // TODO: error
+                                }
+
+                                let node = query_match
+                                    .nodes_for_capture_index(capture)
+                                    .single()
+                                    .unwrap(); // TODO: error
+
+                                let node_text = node.utf8_text(old_source).unwrap(); // TODO: error
+
+                                strings.contains(&node_text)
+                            } else {
+                                eprintln!("first not capture");
+                                false // TODO: error
+                            }
+                        }
+                        s => {
+                            // TODO: report error
+                            eprintln!("unknown predicate {}", s);
+                            false
+                        }
+                    };
+
+                    invert ^ result
+                })
+        })
+        .map(|query_match| QueryMatch {
+            captures: query_match.captures.to_owned(),
+        })
+        .collect()
+}
+
+fn execute_match_in_macros(
+    m: &Match,
+    parser: &mut Parser,
+    cache: &mut FileCache,
+    tree: &mut Tree,
+    log_level: LogLevel,
+) -> Result<(), MatchError> {
+    let macro_query = Query::new(tree_sitter_c::language(), "((preproc_arg) @macro)")
+        .expect("macro_query broken");
+
+    let macros = get_matches(&macro_query, &tree, &cache.bytes);
+
+    for query_match in macros {
+        let node = get_capture_node(&macro_query, &query_match.captures, "macro")
+            .expect("@macro not found");
+        let text = node.utf8_text(&cache.bytes)?.as_bytes().to_owned();
+
+        let mut macro_cache = MacroCache::new(cache, node.byte_range());
+
+        if let Some(mut tree) = parse_source(parser, &text, &PathBuf::new(), log_level, None)
+            .print_reports(&mut macro_cache)?
+        {
+            execute_match(m, parser, &mut macro_cache, &mut tree, log_level)?;
+        }
+    }
+
+    Ok(())
+}
+
 fn execute_statement(
     statement: &Statement,
     parser: &mut Parser,
-    cache: &mut SourceCache,
+    cache: &mut FileCache,
     tree: &mut Tree,
     log_level: LogLevel,
 ) -> Result<(), StatementError> {
     match statement {
         Statement::Match(m) => {
-            execute_match(m, parser, cache, tree, log_level).map_err(StatementError::Match)
+            execute_match(m, parser, cache, tree, log_level)?;
+            execute_match_in_macros(m, parser, cache, tree, log_level)?;
+
+            Ok(())
         }
         Statement::Invalid => Err(StatementError::Invalid),
     }
@@ -537,7 +653,7 @@ impl Interpreter {
 
         let source = fs::read(&source_file).into_diagnostic()?;
 
-        let mut cache = SourceCache::new(source, source_file);
+        let mut cache = FileCache::new(source, source_file);
 
         let tree = parse_source(&mut parser, &cache.bytes, &cache.file, log_level, None)
             .print_reports(&mut cache)

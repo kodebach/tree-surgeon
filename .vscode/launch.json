@@ -46,6 +46,30 @@
         {
             "type": "lldb",
             "request": "launch",
+            "name": "'tree-surgeon'",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--bin=tree-surgeon",
+                    "--package=tree-surgeon"
+                ],
+                "filter": {
+                    "name": "tree-surgeon",
+                    "kind": "bin"
+                }
+            },
+            "args": [
+                "--log-level",
+                "error",
+                "--in-place",
+                "../libelektra/tests/ctest/test_key.c",
+                "../../uni/msc/paper/scripts/rename_funcs_core-kdb.tsg"
+            ],
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
             "name": "Debug unit tests in executable 'tree-surgeon'",
             "cargo": {
                 "args": [
