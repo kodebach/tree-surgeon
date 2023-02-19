@@ -16,4 +16,4 @@ miette = { version = "4.7.1", features = ["fancy"] }
 strum = { version = "0.24.1", features = ["derive"] }
 thiserror = "1.0.31"
 tree-sitter = "0.20.6"
-tree-sitter-c = { path = "tree-sitter-c", version = "0.20.1" }
+tree-sitter-c = "0.20.2"
