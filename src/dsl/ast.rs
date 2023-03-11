@@ -1,6 +1,6 @@
 use std::ops::Range;
 
-use strum::{EnumIter, EnumString, AsRefStr};
+use strum::{AsRefStr, EnumIter, EnumString};
 use tree_sitter::Query;
 
 pub type Span = std::ops::Range<usize>;
@@ -37,17 +37,29 @@ pub struct Script {
 #[derive(Debug)]
 pub struct Match {
     query: Query,
-    replacement: Replace,
+    action: MatchAction,
+}
+
+#[derive(Debug)]
+pub enum MatchAction {
+    Replace(Replace),
+    Warn(Warn),
 }
 
 #[derive(Debug)]
 pub struct Replace {
     capture_name: String,
-    replacement: Replacement,
+    replacement: StringExpression,
 }
 
 #[derive(Debug)]
-pub enum Replacement {
+pub struct Warn {
+    capture_name: String,
+    message: StringExpression,
+}
+
+#[derive(Debug)]
+pub enum StringExpression {
     Literal(String),
     Join(Vec<JoinItem>),
 }
@@ -76,7 +88,7 @@ impl CaptureExpr {
         capture_name: String,
         target_case: Option<Case>,
         range: Option<Range<Option<usize>>>,
-    ) -> CaptureExpr {
+    ) -> Self {
         CaptureExpr {
             capture_name,
             target_case,
@@ -98,7 +110,7 @@ impl CaptureExpr {
 }
 
 impl Replace {
-    pub fn new(capture_name: String, replacement: Replacement) -> Replace {
+    pub fn new(capture_name: String, replacement: StringExpression) -> Self {
         Replace {
             capture_name,
             replacement,
@@ -109,27 +121,44 @@ impl Replace {
         &self.capture_name
     }
 
-    pub fn replacement<'a>(&'a self) -> &'a Replacement {
+    pub fn replacement<'a>(&'a self) -> &'a StringExpression {
         &self.replacement
+    }
+}
+
+impl Warn {
+    pub fn new(capture_name: String, message: StringExpression) -> Self {
+        Warn {
+            capture_name,
+            message,
+        }
+    }
+
+    pub fn capture_name<'a>(&'a self) -> &'a str {
+        &self.capture_name
+    }
+
+    pub fn message<'a>(&'a self) -> &'a StringExpression {
+        &self.message
     }
 }
 
 impl Match {
-    pub fn new(query: Query, replacement: Replace) -> Match {
-        Match { query, replacement }
+    pub fn new(query: Query, action: MatchAction) -> Self {
+        Match { query, action }
     }
 
-    pub fn query<'a>(self: &'a Self) -> &'a Query {
+    pub fn query(&self) -> &Query {
         &self.query
     }
 
-    pub fn replacement<'a>(self: &'a Self) -> &'a Replace {
-        &self.replacement
+    pub fn action(&self) -> &MatchAction {
+        &self.action
     }
 }
 
 impl Script {
-    pub fn new(statements: Vec<Statement>) -> Script {
+    pub fn new(statements: Vec<Statement>) -> Self {
         Script { statements }
     }
 

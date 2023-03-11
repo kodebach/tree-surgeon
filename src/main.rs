@@ -2,7 +2,8 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
-use tree_surgeon::interpreter::{Interpreter, self};
+use is_terminal::IsTerminal;
+use tree_surgeon::interpreter::{self, Interpreter};
 
 #[derive(clap::Parser, Debug)]
 #[clap(author, version, about, long_about=None)]
@@ -42,8 +43,15 @@ fn main() -> miette::Result<()> {
         LogLevel::None => interpreter::LogLevel::None,
     };
 
-    let interpreter =
-        Interpreter::new(cli.source_file, cli.script_file, log_level, cli.in_place)?;
+    let config = ariadne::Config::default().with_color(std::io::stderr().is_terminal());
+
+    let interpreter = Interpreter::new(
+        cli.source_file,
+        cli.script_file,
+        log_level,
+        cli.in_place,
+        config,
+    )?;
 
     interpreter.run()
 }

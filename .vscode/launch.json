@@ -26,7 +26,26 @@
         {
             "type": "lldb",
             "request": "launch",
-            "name": "Debug executable 'tree-surgeon'",
+            "name": "Debug unit tests in executable 'tree-surgeon'",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--no-run",
+                    "--bin=tree-surgeon",
+                    "--package=tree-surgeon"
+                ],
+                "filter": {
+                    "name": "tree-surgeon",
+                    "kind": "bin"
+                }
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug executable 'tree-surgeon' (from stdin)",
             "cargo": {
                 "args": [
                     "build",
@@ -46,7 +65,7 @@
         {
             "type": "lldb",
             "request": "launch",
-            "name": "'tree-surgeon'",
+            "name": "Debug executable 'tree-surgeon' (with script)",
             "cargo": {
                 "args": [
                     "build",
@@ -59,31 +78,9 @@
                 }
             },
             "args": [
-                "--log-level",
-                "error",
-                "--in-place",
-                "../libelektra/tests/ctest/test_key.c",
-                "../../uni/msc/paper/scripts/rename_funcs_core-kdb.tsg"
+                "${input:file}",
+                "${input:script_file}",
             ],
-            "cwd": "${workspaceFolder}"
-        },
-        {
-            "type": "lldb",
-            "request": "launch",
-            "name": "Debug unit tests in executable 'tree-surgeon'",
-            "cargo": {
-                "args": [
-                    "test",
-                    "--no-run",
-                    "--bin=tree-surgeon",
-                    "--package=tree-surgeon"
-                ],
-                "filter": {
-                    "name": "tree-surgeon",
-                    "kind": "bin"
-                }
-            },
-            "args": [],
             "cwd": "${workspaceFolder}"
         }
     ],
@@ -91,8 +88,14 @@
         {
             "id": "file",
             "type": "promptString",
-            "description": "Path",
+            "description": "File Path",
             "default": "../libelektra/src/libs/elektra/key.c"
+        },
+        {
+            "id": "script_file",
+            "type": "promptString",
+            "description": "Script Path",
+            "default": "../../uni/msc/paper/scripts/detect_nonthreadsafe.tsg"
         }
     ]
 }

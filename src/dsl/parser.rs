@@ -7,7 +7,8 @@ use strum::IntoEnumIterator;
 use tree_sitter::{Language, Query as TsQuery};
 
 use super::ast::{
-    CaptureExpr, Case, JoinItem, Match, Replace, Replacement, Script, Span, Statement,
+    CaptureExpr, Case, JoinItem, Match, MatchAction, Replace, Script, Span, Statement,
+    StringExpression, Warn,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -32,6 +33,7 @@ impl fmt::Display for Token {
             Token::Keyword(keyword) => match keyword {
                 Keyword::Match => write!(f, "match"),
                 Keyword::Replace => write!(f, "replace"),
+                Keyword::Warn => write!(f, "warn"),
                 Keyword::With => write!(f, "with"),
                 Keyword::By => write!(f, "by"),
             },
@@ -44,6 +46,7 @@ impl fmt::Display for Token {
 enum Keyword {
     Match,
     Replace,
+    Warn,
     With,
     By,
 }
@@ -256,7 +259,11 @@ impl fmt::Display for Query {
 }
 
 pub trait Parsable: Sized {
-    fn parse<'a>(source: &'a str, language: Language) -> (Option<Script>, Vec<Report>);
+    fn parse<'a, 'b>(
+        source: &'a str,
+        language: Language,
+        config: ariadne::Config,
+    ) -> (Option<Script>, Vec<Report<'b>>);
 }
 
 fn lexer() -> impl Parser<char, Vec<(Token, Span)>, Error = Simple<char>> {
@@ -298,6 +305,7 @@ fn lexer() -> impl Parser<char, Vec<(Token, Span)>, Error = Simple<char>> {
     let keyword = choice((
         just("match").to(Keyword::Match).labelled("match"),
         just("replace").to(Keyword::Replace).labelled("replace"),
+        just("warn").to(Keyword::Warn).labelled("warn"),
         just("by").to(Keyword::By).labelled("by"),
         just("with").to(Keyword::With).labelled("with"),
     ))
@@ -356,12 +364,12 @@ fn lexer() -> impl Parser<char, Vec<(Token, Span)>, Error = Simple<char>> {
         let exp = just('e')
             .or(just('E'))
             .chain(just('+').or(just('-')).or_not())
-            .chain(text::digits(10));
+            .chain::<char, _, _>(text::digits(10));
 
         just('-')
             .or_not()
-            .chain(text::int(10))
-            .chain(frac.or_not().flatten())
+            .chain::<char, _, _>(text::int(10))
+            .chain::<char, _, _>(frac.or_not().flatten())
             .chain::<char, _, _>(exp.or_not().flatten())
             .collect::<String>()
             .map(Token::Num)
@@ -388,29 +396,30 @@ struct DslParser {
 }
 
 impl DslParser {
-    fn replacement(&self) -> impl Parser<Token, Replace, Error = Simple<Token>> + Clone {
-        let capture = filter_map(|span, tok| match tok {
+    fn capture() -> impl Parser<Token, Capture, Error = Simple<Token>> + Clone {
+        filter_map(|span, tok| match tok {
             Token::Capture(name) => Ok(name.clone()),
             _ => Err(Simple::expected_input_found(
                 span,
                 vec![Some(Token::Capture(Capture(String::from("_"))))],
                 Some(tok),
             )),
-        });
+        })
+    }
 
-        let str_ = filter_map(|span, tok| match tok {
+    fn string_literal() -> impl Parser<Token, String, Error = Simple<Token>> + Clone {
+        filter_map(|span, tok| match tok {
             Token::Str(str_) => Ok(str_.clone()),
             _ => Err(Simple::expected_input_found(
                 span,
                 vec![Some(Token::Str(Str(String::from("_"))))],
                 Some(tok),
             )),
-        });
+        })
+        .map(|str| str.0)
+    }
 
-        let literal_replace = just(Token::Keyword(Keyword::With))
-            .then(str_.labelled("replacement literal"))
-            .map(|(_, literal)| Replacement::Literal(literal.0));
-
+    fn join_expr() -> impl Parser<Token, Vec<JoinItem>, Error = Simple<Token>> + Clone {
         let recase_ident = filter_map(move |span, tok| match tok {
             Token::Ident(ident) => Ok(ident.0),
             _ => Err(Simple::expected_input_found(
@@ -423,8 +432,7 @@ impl DslParser {
         .try_map(|res, span| res.map_err(|e| Simple::custom(span, e.to_string())));
 
         let recase_suffix = just(Token::Ctrl('$'))
-            .then(recase_ident)
-            .map(|(_, case)| case)
+            .ignore_then(recase_ident)
             .labelled("recase suffix");
 
         let index = filter_map(|span, tok| match tok {
@@ -441,40 +449,60 @@ impl DslParser {
 
         let range_suffix = index
             .or_not()
-            .then(just(Token::Ctrl(':')))
+            .then_ignore(just(Token::Ctrl(':')))
             .then(index.or_not())
             .delimited_by(just(Token::Ctrl('[')), just(Token::Ctrl(']')))
             .labelled("index range");
 
-        let capture_expr = capture
+        let capture_expr = Self::capture()
             .then(recase_suffix.or_not())
             .then(range_suffix.or_not());
 
-        let join_replace = just(Token::Keyword(Keyword::By))
-            .then(
-                choice((
-                    str_.map(|str| JoinItem::Literal(str.0)),
-                    capture_expr.map(|((capture, case), range)| {
-                        if let Some(((from, _), to)) = range {
-                            JoinItem::CaptureExpr(CaptureExpr::new(capture.0, case, Some(from..to)))
-                        } else {
-                            JoinItem::CaptureExpr(CaptureExpr::new(capture.0, case, None))
-                        }
-                    }),
-                ))
-                .repeated()
-                .delimited_by(just(Token::Ctrl('[')), just(Token::Ctrl(']')))
-                .labelled("replacement expression"),
-            )
-            .map(|(_, items)| Replacement::Join(items));
-
-        just(Token::Keyword(Keyword::Replace))
-            .then(capture.labelled("capture reference"))
-            .then(choice((literal_replace, join_replace)))
-            .map(|((_, capture), replacement)| Replace::new(capture.0, replacement))
+        choice((
+            Self::string_literal().map(JoinItem::Literal),
+            capture_expr.map(|((capture, case), range)| {
+                if let Some((from, to)) = range {
+                    JoinItem::CaptureExpr(CaptureExpr::new(capture.0, case, Some(from..to)))
+                } else {
+                    JoinItem::CaptureExpr(CaptureExpr::new(capture.0, case, None))
+                }
+            }),
+        ))
+        .repeated()
+        .delimited_by(just(Token::Ctrl('[')), just(Token::Ctrl(']')))
     }
 
-    fn query(&self) -> impl Parser<Token, Query, Error = Simple<Token>> + Clone {
+    fn string_expression() -> impl Parser<Token, StringExpression, Error = Simple<Token>> + Clone {
+        choice((
+            Self::string_literal()
+                .labelled("string literal")
+                .map(StringExpression::Literal),
+            Self::join_expr()
+                .labelled("string join expression")
+                .map(StringExpression::Join),
+        ))
+    }
+
+    fn replacement() -> impl Parser<Token, Replace, Error = Simple<Token>> + Clone {
+        just(Token::Keyword(Keyword::Replace))
+            .ignore_then(Self::capture().labelled("capture reference").map(|c| c.0))
+            .then(choice((
+                just(Token::Keyword(Keyword::With))
+                    .ignore_then(Self::string_literal())
+                    .map(StringExpression::Literal),
+                just(Token::Keyword(Keyword::By)).ignore_then(Self::string_expression()),
+            )))
+            .map(|(capture, replacement)| Replace::new(capture, replacement))
+    }
+
+    fn warning() -> impl Parser<Token, Warn, Error = Simple<Token>> + Clone {
+        just(Token::Keyword(Keyword::Warn))
+            .ignore_then(Self::capture().labelled("capture reference").map(|c| c.0))
+            .then(Self::string_expression())
+            .map(|(capture, string_expr)| Warn::new(capture, string_expr))
+    }
+
+    fn query() -> impl Parser<Token, Query, Error = Simple<Token>> + Clone {
         let capture = filter_map(|span, tok| match tok {
             Token::Capture(c) => Ok(c),
             _ => Err(Simple::expected_input_found(
@@ -657,12 +685,21 @@ impl DslParser {
             .labelled("query")
     }
 
+    fn match_action() -> impl Parser<Token, MatchAction, Error = Simple<Token>> + Clone {
+        choice((
+            Self::replacement()
+                .labelled("replacement")
+                .map(MatchAction::Replace),
+            Self::warning().labelled("warning").map(MatchAction::Warn),
+        ))
+    }
+
     fn match_<'a>(
         &'a self,
     ) -> impl Parser<Token, Option<Match>, Error = Simple<Token>> + Clone + 'a {
         just(Token::Keyword(Keyword::Match))
-            .then(
-                self.query()
+            .ignore_then(
+                Self::query()
                     .validate(|query, span, emit| {
                         if query.0.iter().any(|item| item == &QueryItem::Invalid) {
                             emit(Simple::custom(span, "malformatted query"));
@@ -681,8 +718,8 @@ impl DslParser {
                     })
                     .labelled("query"),
             )
-            .then(self.replacement().labelled("replacement"))
-            .map(|((_, query), replacement)| query.map(|query| Match::new(query, replacement)))
+            .then(Self::match_action().labelled("action"))
+            .map(|(query, replacement)| query.map(|query| Match::new(query, replacement)))
     }
 
     fn statement<'a>(
@@ -707,7 +744,11 @@ impl DslParser {
 }
 
 impl Parsable for Script {
-    fn parse<'a>(source: &'a str, language: Language) -> (Option<Script>, Vec<Report>) {
+    fn parse<'a, 'b>(
+        source: &'a str,
+        language: Language,
+        config: ariadne::Config,
+    ) -> (Option<Script>, Vec<Report<'b>>) {
         let (tokens, errs) = lexer().parse_recovery(source);
 
         let (script, parse_errs) = if let Some(tokens) = tokens {
@@ -732,7 +773,8 @@ impl Parsable for Script {
             .map(|e| e.map(|c| c.to_string()))
             .chain(parse_errs.into_iter().map(|e| e.map(|tok| tok.to_string())))
             .map(|e| {
-                let report = Report::build(ReportKind::Error, (), e.span().start);
+                let report =
+                    Report::build(ReportKind::Error, (), e.span().start).with_config(config);
 
                 let report = match e.reason() {
                     chumsky::error::SimpleReason::Unclosed { span, delimiter } => report
