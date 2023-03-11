@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::Parser;
+use clap::{Parser, ArgAction};
 
 use is_terminal::IsTerminal;
 use tree_surgeon::interpreter::{self, Interpreter};
@@ -23,6 +23,10 @@ struct Cli {
     /// write output to the input source file
     #[clap(short, long)]
     in_place: bool,
+
+    /// search in macros
+    #[clap(long, action = ArgAction::Set)]
+    parse_macros: bool,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, clap::ArgEnum)]
@@ -50,6 +54,7 @@ fn main() -> miette::Result<()> {
         cli.script_file,
         log_level,
         cli.in_place,
+        cli.parse_macros,
         config,
     )?;
 

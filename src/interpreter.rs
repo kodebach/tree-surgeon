@@ -189,6 +189,7 @@ pub struct Interpreter {
     parser: Parser,
     log_level: LogLevel,
     in_place: bool,
+    parse_macros: bool,
     config: ariadne::Config,
 }
 
@@ -513,13 +514,20 @@ fn execute_match(
     mut cache: FileCache,
     tree: &mut Tree,
     log_level: LogLevel,
+    parse_macros: bool,
     config: ariadne::Config,
 ) -> Result<(), MatchError> {
     loop {
         let old_tree = tree.clone();
 
         let result = execute_match_on_tree(m, &cache, &old_tree, config)?
-            .chain(|| execute_match_in_macros(m, parser, &cache, &old_tree, log_level, config))?
+            .chain(|| {
+                if parse_macros {
+                    execute_match_in_macros(m, parser, &cache, &old_tree, log_level, config)
+                } else {
+                    Ok(MatchData::default())
+                }
+            })?
             .print_reports(cache.clone())?;
 
         let TreeEdit { edit, new_text } = if let Some(tree_edit) = result {
@@ -798,11 +806,12 @@ fn execute_statement(
     cache: FileCache,
     tree: &mut Tree,
     log_level: LogLevel,
+    parse_macros: bool,
     config: ariadne::Config,
 ) -> Result<(), StatementError> {
     match statement {
         Statement::Match(m) => {
-            execute_match(m, parser, cache, tree, log_level, config)?;
+            execute_match(m, parser, cache, tree, log_level, parse_macros, config)?;
 
             Ok(())
         }
@@ -842,6 +851,7 @@ impl Interpreter {
         script_file: Option<PathBuf>,
         log_level: LogLevel,
         in_place: bool,
+        parse_macros: bool,
         config: ariadne::Config,
     ) -> miette::Result<Interpreter> {
         let mut parser = Parser::new();
@@ -888,6 +898,7 @@ impl Interpreter {
             parser,
             log_level,
             in_place,
+            parse_macros,
             config,
         })
     }
@@ -900,6 +911,7 @@ impl Interpreter {
                 self.cache.clone(),
                 &mut self.tree,
                 self.log_level,
+                self.parse_macros,
                 self.config,
             )?
         }
