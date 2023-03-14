@@ -25,7 +25,7 @@ struct Cli {
     in_place: bool,
 
     /// search in macros
-    #[clap(long, action = ArgAction::Set)]
+    #[clap(long, action = ArgAction::Set, default_value_t = true)]
     parse_macros: bool,
 }
 
