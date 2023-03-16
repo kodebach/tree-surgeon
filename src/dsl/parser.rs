@@ -20,6 +20,7 @@ enum Token {
     PredicateName(PredicateName),
     Keyword(Keyword),
     Ctrl(char),
+    Comment,
 }
 
 impl fmt::Display for Token {
@@ -38,6 +39,7 @@ impl fmt::Display for Token {
                 Keyword::By => write!(f, "by"),
             },
             Token::Ctrl(c) => write!(f, "{}", c),
+            Token::Comment => Ok(()),
         }
     }
 }
@@ -85,6 +87,7 @@ struct Ident(String);
 enum PredicateArg {
     Capture(Capture),
     Str(Str),
+    Ident(Ident),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -105,6 +108,7 @@ impl fmt::Display for Predicate {
             write!(f, " ")?;
             match arg {
                 PredicateArg::Capture(c) => c.fmt(f)?,
+                PredicateArg::Ident(i) => i.fmt(f)?,
                 PredicateArg::Str(s) => s.fmt(f)?,
             }
         }
@@ -376,7 +380,13 @@ fn lexer() -> impl Parser<char, Vec<(Token, Span)>, Error = Simple<char>> {
             .labelled("number")
     };
 
+    let comment = just("--")
+        .ignore_then(take_until(text::newline()))
+        .ignored()
+        .map(|_| Token::Comment);
+
     let token = keyword
+        .or(comment)
         .or(ctrl)
         .or(string)
         .or(capture)
@@ -419,17 +429,22 @@ impl DslParser {
         .map(|str| str.0)
     }
 
-    fn join_expr() -> impl Parser<Token, Vec<JoinItem>, Error = Simple<Token>> + Clone {
-        let recase_ident = filter_map(move |span, tok| match tok {
-            Token::Ident(ident) => Ok(ident.0),
+    fn ident() -> impl Parser<Token, Ident, Error = Simple<Token>> + Clone {
+        filter_map(move |span, tok| match tok {
+            Token::Ident(ident) => Ok(ident),
             _ => Err(Simple::expected_input_found(
                 span,
                 Case::iter().map(|case| Some(Token::Ident(Ident(case.as_ref().to_owned())))),
                 Some(tok),
             )),
         })
-        .from_str::<Case>()
-        .try_map(|res, span| res.map_err(|e| Simple::custom(span, e.to_string())));
+    }
+
+    fn join_expr() -> impl Parser<Token, Vec<JoinItem>, Error = Simple<Token>> + Clone {
+        let recase_ident = Self::ident()
+            .map(|i| i.0)
+            .from_str::<Case>()
+            .try_map(|res, span| res.map_err(|e| Simple::custom(span, e.to_string())));
 
         let recase_suffix = just(Token::Ctrl('$'))
             .ignore_then(recase_ident)
@@ -534,14 +549,26 @@ impl DslParser {
             })
             .labelled("predicate name");
 
+            let ident = filter_map(|span, tok| match tok {
+                Token::Ident(ident) => Ok(ident),
+                _ => Err(Simple::expected_input_found(
+                    span,
+                    vec![Some(Token::Ident(Ident(String::from("_"))))],
+                    Some(tok),
+                )),
+            })
+            .labelled("identifier");
+
             predicate_name
                 .then(
-                    capture
-                        .map(PredicateArg::Capture)
-                        .or(string.map(PredicateArg::Str))
-                        .repeated()
-                        .or_not()
-                        .map(|v| v.unwrap_or_default()),
+                    choice((
+                        capture.map(PredicateArg::Capture),
+                        string.map(PredicateArg::Str),
+                        ident.map(PredicateArg::Ident),
+                    ))
+                    .repeated()
+                    .or_not()
+                    .map(|v| v.unwrap_or_default()),
                 )
                 .map(|(n, a)| Predicate(n, a))
                 .labelled("predicate")
@@ -755,9 +782,12 @@ impl Parsable for Script {
             let parser = DslParser { language };
 
             let len = source.chars().count();
-            let (ast, parse_errs) = parser
-                .script()
-                .parse_recovery(Stream::from_iter(len..len + 1, tokens.into_iter()));
+            let (ast, parse_errs) = parser.script().parse_recovery(Stream::from_iter(
+                len..len + 1,
+                tokens
+                    .into_iter()
+                    .filter(|(token, _)| !matches!(token, Token::Comment)),
+            ));
 
             if let Some(script) = ast.filter(|_| errs.len() + parse_errs.len() == 0) {
                 (Some(script), parse_errs)

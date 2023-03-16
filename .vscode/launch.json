@@ -89,13 +89,13 @@
             "id": "file",
             "type": "promptString",
             "description": "File Path",
-            "default": "../libelektra/src/libs/elektra/key.c"
+            "default": "../libelektra/src/plugins/glob/glob.c"
         },
         {
             "id": "script_file",
             "type": "promptString",
             "description": "Script Path",
-            "default": "../../uni/msc/paper/scripts/detect_nonthreadsafe.tsg"
+            "default": "../../uni/msc/paper/scripts/threadsafe_strtok.tsg"
         }
     ]
 }

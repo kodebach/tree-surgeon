@@ -1,6 +1,7 @@
 use std::{
     borrow::{Borrow, BorrowMut},
     cell::{Ref, RefCell},
+    collections::HashMap,
     fs,
     io::{self, Read, Write},
     ops::{Index, Range},
@@ -11,7 +12,7 @@ use ariadne::{Cache, Color, Label, Report, ReportKind, Source, Span};
 use convert_case::Casing;
 use miette::{Diagnostic, IntoDiagnostic, NamedSource, SourceSpan};
 use tree_sitter::{
-    InputEdit, Node, Parser, Point, Query, QueryCapture, QueryCursor, QueryPredicateArg, Tree,
+    InputEdit, Node, Parser, Point, Query, QueryCursor, QueryPredicateArg, Tree,
     TreeCursor,
 };
 
@@ -223,6 +224,9 @@ enum MatchError {
     #[error(transparent)]
     #[diagnostic(code(tree_surgeon::string::utf8))]
     Utf8(#[from] std::str::Utf8Error),
+    #[error("Capture not found: {0}")]
+    #[diagnostic(code(tree_surgeon::r#match::capture_not_found))]
+    CaptureNotFound(String),
 }
 
 #[derive(Diagnostic, Debug, thiserror::Error)]
@@ -441,8 +445,7 @@ fn execute_match_in_macros(
     let mut reports = Vec::default();
 
     for query_match in macros {
-        let node = get_capture_node(&macro_query, &query_match.captures, "macro")
-            .expect("@macro not found");
+        let node = query_match.captures.get("macro").expect("@macro not found");
 
         let macro_cache = MacroCache::new(cache.clone(), node.byte_range());
 
@@ -480,29 +483,40 @@ fn execute_match_on_tree(
     let old_source = cache.bytes().get().to_vec();
 
     let matches = get_matches(query, tree, &old_source);
+    let result = 'a: {
+        let mut reports = Vec::default();
 
-    let result = if let Some(query_match) = matches.iter().next() {
-        let action = m.action();
-        match action {
-            MatchAction::Replace(replacement) => execute_replace(
-                replacement,
-                query,
-                query_match,
-                || {
-                    Ok(NamedSource::new(
-                        cache.file().to_string_lossy(),
-                        String::from_utf8(cache.bytes().get().to_vec())
-                            .map_err(MatchError::FromUtf8)?,
-                    ))
-                },
-                &old_source,
-            )?,
-            MatchAction::Warn(warn) => {
-                execute_warn(warn, query, query_match, cache, &old_source, config)?
+        for query_match in matches {
+            let action = m.action();
+            let mut result = match action {
+                MatchAction::Replace(replacement) => execute_replace(
+                    replacement,
+                    &query_match,
+                    || {
+                        Ok(NamedSource::new(
+                            cache.file().to_string_lossy(),
+                            String::from_utf8(cache.bytes().get().to_vec())
+                                .map_err(MatchError::FromUtf8)?,
+                        ))
+                    },
+                    &old_source,
+                )?,
+                MatchAction::Warn(warn) => {
+                    execute_warn(warn, &query_match, cache, &old_source, config)?
+                }
+            };
+
+            if result.tree_edit.is_some() {
+                break 'a result;
             }
+
+            reports.append(&mut result.reports);
         }
-    } else {
-        MatchData::default()
+
+        MatchData {
+            tree_edit: None,
+            reports,
+        }
     };
 
     Ok(result)
@@ -551,32 +565,6 @@ fn execute_match(
     }
 }
 
-fn get_capture_node<'tree>(
-    query: &Query,
-    captures: &[QueryCapture<'tree>],
-    capture_name: &str,
-) -> Result<Node<'tree>, MatchError> {
-    let capture_index = if let Some(capture_index) = query.capture_index_for_name(capture_name) {
-        capture_index
-    } else {
-        return Err(MatchError::Replacement(ReplacementError::MissingCapture {
-            capture_name: capture_name.to_string(),
-        }));
-    };
-
-    captures
-        .iter()
-        .filter_map(move |capture| {
-            if capture.index == capture_index {
-                Some(capture.node)
-            } else {
-                None
-            }
-        })
-        .single()
-        .map_err(MatchError::Single)
-}
-
 fn error_ancestor(node: Node) -> Option<Node> {
     if let Some(parent) = node.parent() {
         if parent.is_error() {
@@ -592,7 +580,6 @@ fn error_ancestor(node: Node) -> Option<Node> {
 // TODO: better types
 fn execute_replace<F>(
     replacement: &Replace,
-    query: &Query,
     query_match: &QueryMatch,
     get_src: F,
     source: &[u8],
@@ -600,14 +587,20 @@ fn execute_replace<F>(
 where
     F: FnOnce() -> Result<NamedSource, MatchError>,
 {
-    let node = get_capture_node(query, &query_match.captures, replacement.capture_name())?;
+    let node =
+        query_match
+            .captures
+            .get(replacement.capture_name())
+            .ok_or(MatchError::Replacement(ReplacementError::MissingCapture {
+                capture_name: replacement.capture_name().to_string(),
+            }))?;
 
     let start_byte = node.start_byte();
     let old_end_byte = node.end_byte();
     let start_position = node.start_position();
     let old_end_position = node.end_position();
 
-    if let Some(error) = error_ancestor(node) {
+    if let Some(error) = error_ancestor(*node) {
         let error_start_byte = error.start_byte();
         let error_end_byte = error.end_byte();
 
@@ -620,7 +613,15 @@ where
     }
     let new_text = evaluate_string_expression(
         replacement.replacement(),
-        |name| get_capture_node(query, &query_match.captures, name),
+        |name| {
+            query_match
+                .captures
+                .get(name)
+                .ok_or(MatchError::Replacement(ReplacementError::MissingCapture {
+                    capture_name: name.to_string(),
+                }))
+                .copied()
+        },
         source,
     )?;
     let line_ending_count = new_text.chars().filter(|c| *c == '\n').count();
@@ -690,17 +691,24 @@ where
 
 fn execute_warn(
     warn: &Warn,
-    query: &Query,
     query_match: &QueryMatch,
     cache: &impl SourceCache,
     source: &[u8],
     config: ariadne::Config,
 ) -> MatchResult {
-    let node = get_capture_node(query, &query_match.captures, warn.capture_name())?;
+    let node = query_match.captures.get(warn.capture_name());
+
+    let Some(node) = node else { return Ok(MatchData::default()); };
 
     let msg = evaluate_string_expression(
         warn.message(),
-        |name| get_capture_node(query, &query_match.captures, name),
+        |name| {
+            query_match
+                .captures
+                .get(name)
+                .ok_or(MatchError::CaptureNotFound(name.to_string()))
+                .copied()
+        },
         source,
     )?;
 
@@ -725,7 +733,7 @@ fn execute_warn(
 }
 
 struct QueryMatch<'tree> {
-    captures: Vec<QueryCapture<'tree>>,
+    captures: HashMap<String, Node<'tree>>,
 }
 
 fn get_matches<'t>(query: &Query, tree: &'t Tree, old_source: &[u8]) -> Vec<QueryMatch<'t>> {
@@ -794,8 +802,14 @@ fn get_matches<'t>(query: &Query, tree: &'t Tree, old_source: &[u8]) -> Vec<Quer
                     invert ^ result
                 })
         })
-        .map(|query_match| QueryMatch {
-            captures: query_match.captures.to_owned(),
+        .filter_map(|query_match| {
+            let captures: HashMap<_, _> = query_match
+                .captures
+                .iter()
+                .map(|c| (query.capture_names()[c.index as usize].clone(), c.node))
+                .collect();
+
+            Some(QueryMatch { captures })
         })
         .collect()
 }

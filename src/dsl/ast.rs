@@ -89,7 +89,7 @@ impl CaptureExpr {
         target_case: Option<Case>,
         range: Option<Range<Option<usize>>>,
     ) -> Self {
-        CaptureExpr {
+        Self {
             capture_name,
             target_case,
             range,
@@ -111,7 +111,7 @@ impl CaptureExpr {
 
 impl Replace {
     pub fn new(capture_name: String, replacement: StringExpression) -> Self {
-        Replace {
+        Self {
             capture_name,
             replacement,
         }
@@ -128,7 +128,7 @@ impl Replace {
 
 impl Warn {
     pub fn new(capture_name: String, message: StringExpression) -> Self {
-        Warn {
+        Self {
             capture_name,
             message,
         }
@@ -145,7 +145,7 @@ impl Warn {
 
 impl Match {
     pub fn new(query: Query, action: MatchAction) -> Self {
-        Match { query, action }
+        Self { query, action }
     }
 
     pub fn query(&self) -> &Query {
@@ -159,7 +159,7 @@ impl Match {
 
 impl Script {
     pub fn new(statements: Vec<Statement>) -> Self {
-        Script { statements }
+        Self { statements }
     }
 
     pub fn statements<'a>(self: &'a Self) -> &'a [Statement] {
