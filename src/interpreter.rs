@@ -1,5 +1,5 @@
 use std::{
-    borrow::{Borrow, BorrowMut},
+    borrow::BorrowMut,
     cell::{Ref, RefCell},
     collections::{HashMap, HashSet},
     fs,
@@ -8,8 +8,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use ariadne::{Cache, Color, Label, Report, ReportKind, Source, Span};
+use ariadne::{Cache, Color, Label, Report, ReportKind, Source};
 use convert_case::Casing;
+use lazycell::LazyCell;
 use miette::{Diagnostic, IntoDiagnostic, NamedSource, SourceSpan};
 use tree_sitter::{
     InputEdit, Node, Parser, Point, Query, QueryCursor, QueryPredicateArg, Tree, TreeCursor,
@@ -40,15 +41,15 @@ trait SourceCache: Cache<PathBuf> {
 #[derive(Clone)]
 struct FileCache {
     bytes: RefCell<Vec<u8>>,
-    src: Source,
+    source: LazyCell<Source>,
     file: PathBuf,
 }
 
 impl FileCache {
     fn new(bytes: Vec<u8>, file: PathBuf) -> FileCache {
         FileCache {
-            src: Source::from(String::from_utf8_lossy(&bytes)),
             bytes: RefCell::new(bytes),
+            source: LazyCell::new(),
             file,
         }
     }
@@ -75,14 +76,17 @@ impl SourceCache for FileCache {
         F: FnOnce(&mut Vec<u8>),
     {
         update_fn(&mut self.bytes.borrow_mut());
-        self.src = Source::from(String::from_utf8_lossy(&self.bytes.borrow()));
     }
 }
 
 impl Cache<PathBuf> for FileCache {
     fn fetch(&mut self, id: &PathBuf) -> Result<&Source, Box<dyn std::fmt::Debug + '_>> {
         if id == &self.file {
-            Ok(&self.src)
+            if !self.source.filled() {
+                self.source.fill(Source::from(String::from_utf8_lossy(&self.bytes.borrow()))).unwrap();
+            }
+
+            Ok(&self.source.borrow().unwrap())
         } else {
             Err(Box::new(format!(
                 "Failed to fetch source '{}'",
@@ -395,18 +399,19 @@ fn parse_source(
     }
 }
 
+#[derive(Debug)]
 struct TreeEdit {
     edit: InputEdit,
     new_text: String,
 }
 
-#[derive(Default)]
-struct MatchData {
+#[derive(Default, Debug)]
+struct ResultData {
     tree_edit: Option<TreeEdit>,
     reports: Vec<Report<'static, FileSpan>>,
 }
 
-impl MatchData {
+impl ResultData {
     fn chain<F, E>(self, next: F) -> Result<Self, E>
     where
         F: FnOnce() -> Result<Self, E>,
@@ -421,18 +426,8 @@ impl MatchData {
     }
 }
 
-impl<C> ParseResult<C, FileSpan> for MatchData
-where
-    C: Cache<PathBuf> + Clone,
-{
-    type Data = Option<TreeEdit>;
-
-    fn print_reports(self, cache: C) -> std::io::Result<Self::Data> {
-        (self.tree_edit, self.reports).print_reports(cache)
-    }
-}
-
-type MatchResult = Result<MatchData, MatchError>;
+type MatchResult = Result<ResultData, MatchError>;
+type StatementResult = Result<ResultData, StatementError>;
 
 fn execute_match_in_macros(
     m: &Match,
@@ -454,8 +449,9 @@ fn execute_match_in_macros(
 
         let macro_cache = MacroCache::new(cache.clone(), node.byte_range());
 
-        let tree = parse_source(parser, &macro_cache, log_level, None, config)
-            .print_reports(macro_cache.clone())?;
+        let (tree, mut new_reports) = parse_source(parser, &macro_cache, log_level, None, config);
+
+        reports.append(&mut new_reports);
 
         let mut edit = if let Some(tree) = tree {
             execute_match_on_tree(m, &macro_cache, &tree, config)?
@@ -471,7 +467,7 @@ fn execute_match_in_macros(
         reports.append(&mut edit.reports);
     }
 
-    Ok(MatchData {
+    Ok(ResultData {
         tree_edit: None,
         reports,
     })
@@ -515,7 +511,7 @@ fn execute_match_on_tree(
             reports.append(&mut result.reports);
         }
 
-        MatchData {
+        ResultData {
             tree_edit: None,
             reports,
         }
@@ -527,44 +523,19 @@ fn execute_match_on_tree(
 fn execute_match(
     m: &Match,
     parser: &mut Parser,
-    cache: &mut FileCache,
-    tree: &mut Tree,
+    cache: &FileCache,
+    tree: &Tree,
     log_level: LogLevel,
     parse_macros: bool,
     config: ariadne::Config,
-) -> Result<(), MatchError> {
-    loop {
-        let old_tree = tree.clone();
-
-        let result = execute_match_on_tree(m, cache, &old_tree, config)?
-            .chain(|| {
-                if parse_macros {
-                    execute_match_in_macros(m, parser, &cache, &old_tree, log_level, config)
-                } else {
-                    Ok(MatchData::default())
-                }
-            })?
-            .print_reports(cache.clone())?;
-
-        let TreeEdit { edit, new_text } = if let Some(tree_edit) = result {
-            tree_edit
+) -> MatchResult {
+    execute_match_on_tree(m, cache, tree, config)?.chain(|| {
+        if parse_macros {
+            execute_match_in_macros(m, parser, cache, tree, log_level, config)
         } else {
-            break Ok(());
-        };
-
-        cache.update(|bytes| {
-            bytes.splice(edit.start_byte..edit.old_end_byte, new_text.bytes());
-        });
-        tree.edit(&edit);
-        *tree = parse_source(parser, cache, log_level, Some(tree), config)
-            .print_reports(cache.clone())
-            .map_err(MatchError::Io)?
-            .ok_or(MatchError::Replacement(ReplacementError::TreeParse(
-                TreeParseError {
-                    source_file: cache.file().to_owned(),
-                },
-            )))?;
-    }
+            Ok(ResultData::default())
+        }
+    })
 }
 
 fn error_ancestor(node: Node) -> Option<Node> {
@@ -648,7 +619,7 @@ where
         new_text,
     };
 
-    Ok(MatchData {
+    Ok(ResultData {
         tree_edit: Some(tree_edit),
         reports: Vec::default(),
     })
@@ -713,7 +684,7 @@ fn execute_warn(
 ) -> MatchResult {
     let node = query_match.captures.get(warn.capture_name());
 
-    let Some(node) = node else { return Ok(MatchData::default()); };
+    let Some(node) = node else { return Ok(ResultData::default()); };
 
     let msg = evaluate_string_expression(
         warn.message(),
@@ -741,7 +712,7 @@ fn execute_warn(
             )
             .finish();
 
-    Ok(MatchData {
+    Ok(ResultData {
         tree_edit: None,
         reports: vec![report],
     })
@@ -886,46 +857,54 @@ fn evaluate_where(
 fn execute_statement(
     statement: &Statement,
     parser: &mut Parser,
-    cache: &mut FileCache,
-    tree: &mut Tree,
+    cache: &FileCache,
+    tree: &Tree,
     log_level: LogLevel,
     parse_macros: bool,
     config: ariadne::Config,
-) -> Result<(), StatementError> {
+) -> StatementResult {
     match statement {
         Statement::Match(m) => {
-            execute_match(m, parser, cache, tree, log_level, parse_macros, config)?;
-
-            Ok(())
+            execute_match(m, parser, cache, tree, log_level, parse_macros, config)
+                .map_err(StatementError::Match)
         }
         Statement::Invalid => Err(StatementError::Invalid),
     }
 }
 
-trait ParseResult<C, S>
-where
-    C: Cache<S::SourceId>,
-    S: Span,
-{
-    type Data;
+fn execute_script(
+    script: &Script,
+    parser: &mut Parser,
+    cache: &FileCache,
+    tree: &Tree,
+    log_level: LogLevel,
+    parse_macros: bool,
+    config: ariadne::Config,
+) -> StatementResult {
+    let mut reports = Vec::default();
 
-    fn print_reports(self, cache: C) -> std::io::Result<Self::Data>;
-}
+    for statement in script.statements() {
+        let mut result = execute_statement(
+            statement,
+            parser,
+            cache,
+            tree,
+            log_level,
+            parse_macros,
+            config,
+        )?;
 
-impl<C, S, I, T> ParseResult<C, S> for (T, I)
-where
-    C: Cache<S::SourceId> + Clone,
-    S: Span,
-    I: IntoIterator<Item = Report<'static, S>>,
-{
-    type Data = T;
-
-    fn print_reports(self, cache: C) -> std::io::Result<Self::Data> {
-        for report in self.1 {
-            report.eprint(cache.clone())?;
+        if result.tree_edit.is_some() {
+            return Ok(result);
         }
-        Ok(self.0)
+
+        reports.append(&mut result.reports);
     }
+
+    Ok(ResultData {
+        tree_edit: None,
+        reports,
+    })
 }
 
 impl Interpreter {
@@ -958,9 +937,13 @@ impl Interpreter {
 
         let cache = FileCache::new(source, source_file);
 
-        let tree = parse_source(&mut parser, &cache, log_level, None, config)
-            .print_reports(cache.clone())
-            .into_diagnostic()?
+        let (tree, reports) = parse_source(&mut parser, &cache, log_level, None, config);
+
+        for report in reports {
+            report.eprint(cache.clone()).into_diagnostic()?;
+        }
+
+        let tree = tree
             .ok_or(TreeParseError {
                 source_file: cache.file.to_owned(),
             })
@@ -968,9 +951,13 @@ impl Interpreter {
 
         let script_file = script_file.unwrap_or(PathBuf::from("<stdin>"));
 
-        let script = Script::parse(&script_source, tree.language(), config)
-            .print_reports(Source::from(script_source))
-            .into_diagnostic()?
+        let (script, reports) = Script::parse(&script_source, tree.language(), config);
+
+        for report in reports {
+            report.eprint(Source::from(&script_source)).into_diagnostic()?;
+        }
+
+        let script = script
             .ok_or(ScriptParseError { script_file })
             .into_diagnostic()?;
 
@@ -987,16 +974,44 @@ impl Interpreter {
     }
 
     pub fn run(mut self) -> miette::Result<()> {
-        for statement in self.script.statements() {
-            execute_statement(
-                statement,
+        let mut reports = Vec::default();
+        loop {
+            let mut result = execute_script(
+                &self.script,
                 &mut self.parser,
                 &mut self.cache,
                 &mut self.tree,
                 self.log_level,
                 self.parse_macros,
                 self.config,
-            )?
+            )?;
+
+            reports.append(&mut result.reports);
+
+            let Some(TreeEdit { edit, new_text }) = result.tree_edit else {
+                break;
+            };
+
+            self.cache.update(|bytes| {
+                bytes.splice(edit.start_byte..edit.old_end_byte, new_text.bytes());
+            });
+            self.tree.edit(&edit);
+
+            let (new_tree, mut new_reports) = parse_source(
+                &mut self.parser,
+                &self.cache,
+                self.log_level,
+                Some(&self.tree),
+                self.config,
+            );
+
+            reports.append(&mut new_reports);
+
+            self.tree = new_tree.ok_or(MatchError::Replacement(ReplacementError::TreeParse(
+                TreeParseError {
+                    source_file: self.cache.file().to_owned(),
+                },
+            )))?;
         }
 
         if self.in_place {
@@ -1005,6 +1020,10 @@ impl Interpreter {
             io::stdout()
                 .write(self.cache.bytes().get())
                 .into_diagnostic()?;
+        }
+
+        for report in reports {
+            report.eprint(self.cache.clone()).into_diagnostic()?;
         }
 
         Ok(())
