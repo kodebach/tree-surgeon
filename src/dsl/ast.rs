@@ -74,7 +74,7 @@ pub enum JoinItem {
 pub struct CaptureExpr {
     capture_name: String,
     target_case: Option<Case>,
-    range: Option<Range<Option<usize>>>,
+    range: Option<Range<Option<isize>>>,
 }
 
 #[derive(Debug)]
@@ -87,7 +87,7 @@ impl CaptureExpr {
     pub fn new(
         capture_name: String,
         target_case: Option<Case>,
-        range: Option<Range<Option<usize>>>,
+        range: Option<Range<Option<isize>>>,
     ) -> Self {
         Self {
             capture_name,
@@ -104,7 +104,7 @@ impl CaptureExpr {
         self.target_case
     }
 
-    pub fn range(&self) -> Option<&Range<Option<usize>>> {
+    pub fn range(&self) -> Option<&Range<Option<isize>>> {
         self.range.as_ref()
     }
 }

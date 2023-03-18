@@ -452,7 +452,7 @@ impl DslParser {
 
         let index = filter_map(|span, tok| match tok {
             Token::Num(ref num) => num
-                .parse::<usize>()
+                .parse::<isize>()
                 .map_err(|e| Simple::custom(span, e.to_string())),
             _ => Err(Simple::expected_input_found(
                 span,

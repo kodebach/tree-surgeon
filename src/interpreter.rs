@@ -4,7 +4,7 @@ use std::{
     collections::HashMap,
     fs,
     io::{self, Read, Write},
-    ops::{Index, Range},
+    ops::{Index, Range, Neg},
     path::{Path, PathBuf},
 };
 
@@ -12,8 +12,7 @@ use ariadne::{Cache, Color, Label, Report, ReportKind, Source, Span};
 use convert_case::Casing;
 use miette::{Diagnostic, IntoDiagnostic, NamedSource, SourceSpan};
 use tree_sitter::{
-    InputEdit, Node, Parser, Point, Query, QueryCursor, QueryPredicateArg, Tree,
-    TreeCursor,
+    InputEdit, Node, Parser, Point, Query, QueryCursor, QueryPredicateArg, Tree, TreeCursor,
 };
 
 use crate::{
@@ -677,7 +676,8 @@ where
                             capture_expr
                                 .range()
                                 .map(|Range { start, end }| {
-                                    start.unwrap_or(0)..end.unwrap_or(text.len())
+                                    start.map_or(0, |s| if s.is_negative() { text.len() - s.neg() as usize } else { s as usize })
+                                        ..end.map_or(text.len(), |e| if e.is_negative() { text.len() - e.neg() as usize } else { e as usize })
                                 })
                                 .map_or(text.to_owned(), |range| (&text[range]).to_owned())
                         })
