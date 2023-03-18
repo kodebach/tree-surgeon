@@ -308,30 +308,58 @@ where
         ))
     }
 
+    fn equals_expr() -> impl Parser<'a, I, EqualsExpr, Err<'a>> + Clone {
+        group((
+            Self::string_expression().labelled("left"),
+            just(Token::Equals).ignored(),
+            Self::string_expression().labelled("right"),
+        ))
+        .map(|(left, _, right)| EqualsExpr { left, right })
+    }
+
+    fn where_expr() -> impl Parser<'a, I, WhereExpr, Err<'a>> + Clone {
+        choice((Self::equals_expr().map(WhereExpr::Equals),))
+    }
+
+    fn match_clause() -> impl Parser<'a, I, MatchClause, Err<'a>> + Clone {
+        choice((just(Token::Where)
+            .ignore_then(Self::where_expr())
+            .labelled("where")
+            .map(MatchClause::Where),))
+    }
+
     fn match_(&self) -> impl Parser<'a, I, Option<Match>, Err<'a>> + Clone + '_ {
-        just(Token::Match)
-            .ignore_then(
-                Self::query()
-                    .validate(|query, span, emitter| {
-                        if query.items.iter().any(|item| item == &QueryItem::Invalid) {
-                            emitter.emit(Rich::custom(span, "malformatted query"));
-                            None
-                        } else {
-                            TsQuery::new(self.language, &query.to_string())
-                                .map(Some)
-                                .unwrap_or_else(|e| {
-                                    emitter.emit(Rich::custom(
-                                        span,
-                                        format!("malformatted query: {}", e),
-                                    ));
-                                    None
-                                })
-                        }
-                    })
-                    .labelled("query"),
-            )
-            .then(Self::match_action().labelled("action"))
-            .map(|(query, action)| query.map(|query| Match::new(query, action)))
+        group((
+            just(Token::Match).ignored(),
+            Self::query()
+                .validate(|query, span, emitter| {
+                    if query.items.iter().any(|item| item == &QueryItem::Invalid) {
+                        emitter.emit(Rich::custom(span, "malformatted query"));
+                        None
+                    } else {
+                        TsQuery::new(self.language, &query.to_string())
+                            .map(Some)
+                            .unwrap_or_else(|e| {
+                                emitter
+                                    .emit(Rich::custom(span, format!("malformatted query: {}", e)));
+                                None
+                            })
+                    }
+                })
+                .labelled("query"),
+            Self::match_clause()
+                .repeated()
+                .collect()
+                .labelled("extra clauses"),
+            Self::match_action().labelled("action"),
+        ))
+        .map(|(_, query, clauses, action)| {
+            query.map(|query| Match {
+                query,
+                clauses,
+                action,
+            })
+        })
     }
 
     fn statement(&self) -> impl Parser<'a, I, Statement, Err<'a>> + Clone + '_ {
@@ -343,6 +371,10 @@ where
                     Statement::Invalid
                 })
             })
+            .recover_with(skip_then_retry_until(
+                any().ignored(),
+                just(Token::Semicolon).ignored(),
+            ))
     }
 
     fn script(&self) -> impl Parser<'a, I, Script, Err<'a>> + Clone + '_ {

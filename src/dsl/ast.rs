@@ -37,8 +37,25 @@ pub struct Script {
 
 #[derive(Debug)]
 pub struct Match {
-    query: Query,
-    action: MatchAction,
+    pub query: Query,
+    pub clauses: Vec<MatchClause>,
+    pub action: MatchAction,
+}
+
+#[derive(Debug)]
+pub enum MatchClause {
+    Where(WhereExpr)
+}
+
+#[derive(Debug)]
+pub enum WhereExpr {
+    Equals(EqualsExpr)
+}
+
+#[derive(Debug)]
+pub struct EqualsExpr {
+    pub left: StringExpression,
+    pub right: StringExpression,
 }
 
 #[derive(Debug)]
@@ -141,20 +158,6 @@ impl Warn {
 
     pub fn message<'a>(&'a self) -> &'a StringExpression {
         &self.message
-    }
-}
-
-impl Match {
-    pub fn new(query: Query, action: MatchAction) -> Self {
-        Self { query, action }
-    }
-
-    pub fn query(&self) -> &Query {
-        &self.query
-    }
-
-    pub fn action(&self) -> &MatchAction {
-        &self.action
     }
 }
 

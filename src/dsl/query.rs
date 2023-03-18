@@ -170,7 +170,7 @@ impl fmt::Display for PatternData {
                 }
                 write!(f, ")")
             }
-            PatternData::WildcardNode => write!(f, "_"),
+            PatternData::WildcardNode => write!(f, "(_)"),
         }
     }
 }

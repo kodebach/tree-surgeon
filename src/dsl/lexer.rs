@@ -4,14 +4,14 @@ use logos::{Lexer, Logos};
 
 #[derive(Logos, Debug, Clone, PartialEq)]
 pub enum Token<'a> {
-    #[regex(r"-?[[:digit:]]+(\.[[:digit:]]+)?([eE][+-]?[[:digit]]+)", |lex| lex.slice())]
+    #[regex(r"-?[[:digit:]]+(\.[[:digit:]]+)?([eE][+-]?[[:digit:]]+)?", priority = 2, callback = |lex| lex.slice())]
     Number(&'a str),
     #[regex(
         r#""([^"\\]|\\[\\/"bfnrt]|\\u[[:xdigit:]][[:xdigit:]][[:xdigit:]][[:xdigit:]])*""#,
         parse_string
     )]
     String(String),
-    #[regex(r"[-_[:alnum:]][-_?!.[:alnum:]]*", |lex| lex.slice())]
+    #[regex(r"[-_[:alpha:]][-_?!.[:alnum:]]*", |lex| lex.slice())]
     Identifier(&'a str),
     #[regex(r"@[^()\[\]$.\s]+", |lex| &lex.slice()[1..])]
     Capture(&'a str),
@@ -29,6 +29,8 @@ pub enum Token<'a> {
     With,
     #[token("by")]
     By,
+    #[token("where")]
+    Where,
 
     // control chars
     #[token("(")]
@@ -61,6 +63,8 @@ pub enum Token<'a> {
     Bang,
     #[token(";")]
     Semicolon,
+    #[token("=")]
+    Equals,
 
     #[regex(r"--.*\r?\n", logos::skip)]
     Comment,
@@ -96,6 +100,7 @@ impl Display for Token<'_> {
             Token::Warn => write!(f, "warn"),
             Token::With => write!(f, "with"),
             Token::By => write!(f, "by"),
+            Token::Where => write!(f, "where"),
             Token::LParen => write!(f, "("),
             Token::RParen => write!(f, ")"),
             Token::LBracket => write!(f, "["),
@@ -111,6 +116,7 @@ impl Display for Token<'_> {
             Token::Dot => write!(f, "."),
             Token::Bang => write!(f, "!"),
             Token::Semicolon => write!(f, ";"),
+            Token::Equals => write!(f, "_"),
             Token::Comment => Ok(()),
             Token::Error => Ok(()),
         }
