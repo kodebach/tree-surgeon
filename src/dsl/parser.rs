@@ -1,13 +1,15 @@
-use std::fmt;
+use std::{fmt, marker::PhantomData};
 
-use ariadne::{Color, Fmt, Label, Report, ReportKind};
+use ariadne::{Color, Label, Report, ReportKind};
 
-use chumsky::{prelude::*, text::Character, Stream};
-use strum::IntoEnumIterator;
+use chumsky::{
+    input::{Stream, ValueInput},
+    prelude::*,
+};
 use tree_sitter::{Language, Query as TsQuery};
 
 use super::ast::{
-    CaptureExpr, Case, JoinItem, Match, MatchAction, Replace, Script, Span, Statement,
+    CaptureExpr, Case, JoinItem, Match, MatchAction, Replace, Script, Spanned, Statement,
     StringExpression, Warn,
 };
 
@@ -43,6 +45,8 @@ impl fmt::Display for Token {
         }
     }
 }
+
+trait TokenInput<'a>: ValueInput<'a, Token = Token, Span = SimpleSpan> {}
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum Keyword {
@@ -270,36 +274,35 @@ pub trait Parsable: Sized {
     ) -> (Option<Script>, Vec<Report<'b>>);
 }
 
-fn lexer() -> impl Parser<char, Vec<(Token, Span)>, Error = Simple<char>> {
-    let escape = just('\\').ignore_then(
-        just('\\')
-            .or(just('/'))
-            .or(just('"'))
-            .or(just('b').to('\x08'))
-            .or(just('f').to('\x0C'))
-            .or(just('n').to('\n'))
-            .or(just('r').to('\r'))
-            .or(just('t').to('\t'))
-            .or(just('u').ignore_then(
-                filter(|c: &char| c.is_digit(16))
-                    .repeated()
-                    .exactly(4)
-                    .collect::<String>()
-                    .validate(|digits, span, emit| {
-                        char::from_u32(u32::from_str_radix(&digits, 16).unwrap()).unwrap_or_else(
-                            || {
-                                emit(Simple::custom(span, "invalid unicode character"));
-                                '\u{FFFD}' // unicode replacement character
-                            },
-                        )
-                    }),
+fn lexer<'a>() -> impl Parser<'a, &'a str, Vec<Spanned<Token>>, extra::Err<Rich<'a, char>>> {
+    let escape = just('\\')
+        .then(choice((
+            just('\\'),
+            just('/'),
+            just('"'),
+            just('b').to('\x08'),
+            just('f').to('\x0C'),
+            just('n').to('\n'),
+            just('r').to('\r'),
+            just('t').to('\t'),
+            just('u').ignore_then(text::digits(16).exactly(4).slice().validate(
+                |digits, span, emitter| {
+                    char::from_u32(u32::from_str_radix(digits, 16).unwrap()).unwrap_or_else(|| {
+                        emitter.emit(Rich::custom(span, "invalid unicode character"));
+                        '\u{FFFD}' // unicode replacement character
+                    })
+                },
             )),
-    );
+        )))
+        .ignored();
 
-    let string = just('"')
-        .ignore_then(filter(|c| *c != '\\' && *c != '"').or(escape).repeated())
-        .then_ignore(just('"'))
-        .collect::<String>()
+    let string = none_of(r#"\""#)
+        .ignored()
+        .or(escape)
+        .repeated()
+        .slice()
+        .map(ToString::to_string)
+        .delimited_by(just('"'), just('"'))
         .map(Str)
         .map(Token::Str)
         .labelled("string");
@@ -316,156 +319,140 @@ fn lexer() -> impl Parser<char, Vec<(Token, Span)>, Error = Simple<char>> {
     .labelled("keyword")
     .map(Token::Keyword);
 
+    const SPECIAL_CHARS: &str = "()[]$.";
+
     let capture = just("@")
         .ignore_then(
-            filter(|c: &char| {
-                !c.is_whitespace() && *c != '(' && *c != ')' && *c != '[' && *c != ']' && *c != '$'
-            })
-            .repeated(),
+            any()
+                .filter(|c: &char| !c.is_whitespace() && !SPECIAL_CHARS.contains(*c))
+                .repeated()
+                .map_slice(|c: &str| Capture(c.to_string())),
         )
-        .collect::<String>()
-        .map(Capture)
         .labelled("capture")
         .map(Token::Capture);
 
     let predicate_name = just("#")
         .ignore_then(
-            filter(|c: &char| {
-                !c.is_whitespace() && *c != '(' && *c != ')' && *c != '[' && *c != ']'
-            })
-            .repeated(),
+            any()
+                .filter(|c: &char| !c.is_whitespace() && !SPECIAL_CHARS.contains(*c))
+                .repeated()
+                .map_slice(|c: &str| PredicateName(c.to_string())),
         )
-        .collect::<String>()
-        .map(PredicateName)
         .labelled("predicate name")
         .map(Token::PredicateName);
 
-    let ident = filter(|c: &char| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+    let ident = any()
+        .filter(|c: &char| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
         .then(
-            filter(|c: &char| {
-                c.is_ascii_alphanumeric()
-                    || *c == '_'
-                    || *c == '-'
-                    || *c == '?'
-                    || *c == '!'
-                    || *c == '.'
-            })
-            .repeated()
-            .or_not(),
+            any()
+                .filter(|c: &char| {
+                    c.is_ascii_alphanumeric()
+                        || *c == '_'
+                        || *c == '-'
+                        || *c == '?'
+                        || *c == '!'
+                        || *c == '.'
+                })
+                .repeated()
+                .or_not(),
         )
-        .map(|(first, rest)| {
-            let mut chars = rest.unwrap_or_default();
-            chars.insert(0, first);
-            chars.iter().collect()
-        })
-        .map(Ident)
+        .map_slice(|i: &str| Ident(i.to_string()))
         .labelled("identifier")
         .map(Token::Ident);
 
     let num = {
-        let frac = just('.').chain(text::digits(10));
+        let digits = text::digits(10).slice();
 
-        let exp = just('e')
-            .or(just('E'))
-            .chain(just('+').or(just('-')).or_not())
-            .chain::<char, _, _>(text::digits(10));
+        let frac = just('.').then(digits.clone());
+
+        let exp = one_of("eE")
+            .then(one_of("+-").or_not())
+            .then(digits.clone());
 
         just('-')
             .or_not()
-            .chain::<char, _, _>(text::int(10))
-            .chain::<char, _, _>(frac.or_not().flatten())
-            .chain::<char, _, _>(exp.or_not().flatten())
-            .collect::<String>()
-            .map(Token::Num)
+            .then(text::int(10))
+            .then(frac.or_not())
+            .then(exp.or_not())
+            .map_slice(|n: &str| Token::Num(n.to_string()))
             .labelled("number")
     };
 
     let comment = just("--")
-        .ignore_then(take_until(text::newline()))
-        .ignored()
-        .map(|_| Token::Comment);
+        .then(any().and_is(just('\n').not()).repeated())
+        .padded();
 
-    let token = keyword
-        .or(comment)
-        .or(ctrl)
-        .or(string)
-        .or(capture)
-        .or(predicate_name)
-        .or(num)
-        .or(ident)
-        .recover_with(skip_then_retry_until([]));
+    let token = choice((keyword, ctrl, string, capture, predicate_name, num, ident));
 
     token
         .map_with_span(|tok, span| (tok, span))
+        .padded_by(comment.repeated())
         .padded()
+        .recover_with(skip_then_retry_until(any().ignored(), end()))
         .repeated()
+        .collect()
 }
 
-struct DslParser {
+struct DslParser<'a, I>
+where
+    I: ValueInput<'a, Token = Token, Span = SimpleSpan>,
+{
     language: Language,
+    marker: PhantomData<&'a I>,
 }
 
-impl DslParser {
-    fn capture() -> impl Parser<Token, Capture, Error = Simple<Token>> + Clone {
-        filter_map(|span, tok| match tok {
-            Token::Capture(name) => Ok(name.clone()),
-            _ => Err(Simple::expected_input_found(
-                span,
-                vec![Some(Token::Capture(Capture(String::from("_"))))],
-                Some(tok),
-            )),
-        })
+type Err<'a> = extra::Err<Rich<'a, Token>>;
+
+impl<'a, I> DslParser<'a, I>
+where
+    I: ValueInput<'a, Token = Token, Span = SimpleSpan>,
+{
+    fn capture() -> impl Parser<'a, I, Capture, Err<'a>> + Clone {
+        select! {
+            Token::Capture(name) => name.clone()
+        }
     }
 
-    fn string_literal() -> impl Parser<Token, String, Error = Simple<Token>> + Clone {
-        filter_map(|span, tok| match tok {
-            Token::Str(str_) => Ok(str_.clone()),
-            _ => Err(Simple::expected_input_found(
-                span,
-                vec![Some(Token::Str(Str(String::from("_"))))],
-                Some(tok),
-            )),
-        })
+    fn string_literal() -> impl Parser<'a, I, String, Err<'a>> + Clone {
+        select! {
+            Token::Str(str_) => str_.clone(),
+        }
         .map(|str| str.0)
     }
 
-    fn ident() -> impl Parser<Token, Ident, Error = Simple<Token>> + Clone {
-        filter_map(move |span, tok| match tok {
-            Token::Ident(ident) => Ok(ident),
-            _ => Err(Simple::expected_input_found(
-                span,
-                Case::iter().map(|case| Some(Token::Ident(Ident(case.as_ref().to_owned())))),
-                Some(tok),
-            )),
+    fn ident() -> impl Parser<'a, I, Ident, Err<'a>> + Clone {
+        select! {
+            Token::Ident(ident) => ident,
+        }
+    }
+
+    fn num() -> impl Parser<'a, I, isize, Err<'a>> + Clone {
+        select! {
+            Token::Num(n) => n,
+        }
+        .try_map(|n, span| {
+            n.parse::<isize>()
+                .map_err(|e| Rich::custom(span, e.to_string()))
         })
     }
 
-    fn join_expr() -> impl Parser<Token, Vec<JoinItem>, Error = Simple<Token>> + Clone {
+    fn join_expr() -> impl Parser<'a, I, Vec<JoinItem>, Err<'a>> + Clone {
         let recase_ident = Self::ident()
             .map(|i| i.0)
             .from_str::<Case>()
-            .try_map(|res, span| res.map_err(|e| Simple::custom(span, e.to_string())));
+            .try_map(|res, span| res.map_err(|e| Rich::custom(span, e.to_string())));
 
         let recase_suffix = just(Token::Ctrl('$'))
             .ignore_then(recase_ident)
             .labelled("recase suffix");
 
-        let index = filter_map(|span, tok| match tok {
-            Token::Num(ref num) => num
-                .parse::<isize>()
-                .map_err(|e| Simple::custom(span, e.to_string())),
-            _ => Err(Simple::expected_input_found(
-                span,
-                vec![Some(Token::Num(String::from("123")))],
-                Some(tok),
-            )),
-        })
-        .labelled("index");
+        let index = Self::num().labelled("index");
 
         let range_suffix = index
+            .clone()
             .or_not()
             .then_ignore(just(Token::Ctrl(':')))
-            .then(index.or_not())
+            .then(index.clone().or_not())
             .delimited_by(just(Token::Ctrl('[')), just(Token::Ctrl(']')))
             .labelled("index range");
 
@@ -484,10 +471,11 @@ impl DslParser {
             }),
         ))
         .repeated()
+        .collect()
         .delimited_by(just(Token::Ctrl('[')), just(Token::Ctrl(']')))
     }
 
-    fn string_expression() -> impl Parser<Token, StringExpression, Error = Simple<Token>> + Clone {
+    fn string_expression() -> impl Parser<'a, I, StringExpression, Err<'a>> + Clone {
         choice((
             Self::string_literal()
                 .labelled("string literal")
@@ -498,7 +486,7 @@ impl DslParser {
         ))
     }
 
-    fn replacement() -> impl Parser<Token, Replace, Error = Simple<Token>> + Clone {
+    fn replacement() -> impl Parser<'a, I, Replace, Err<'a>> + Clone {
         just(Token::Keyword(Keyword::Replace))
             .ignore_then(Self::capture().labelled("capture reference").map(|c| c.0))
             .then(choice((
@@ -510,53 +498,33 @@ impl DslParser {
             .map(|(capture, replacement)| Replace::new(capture, replacement))
     }
 
-    fn warning() -> impl Parser<Token, Warn, Error = Simple<Token>> + Clone {
+    fn warning() -> impl Parser<'a, I, Warn, Err<'a>> + Clone {
         just(Token::Keyword(Keyword::Warn))
             .ignore_then(Self::capture().labelled("capture reference").map(|c| c.0))
             .then(Self::string_expression())
             .map(|(capture, string_expr)| Warn::new(capture, string_expr))
     }
 
-    fn query() -> impl Parser<Token, Query, Error = Simple<Token>> + Clone {
-        let capture = filter_map(|span, tok| match tok {
-            Token::Capture(c) => Ok(c),
-            _ => Err(Simple::expected_input_found(
-                span,
-                vec![Some(Token::Capture(Capture(String::from("_"))))],
-                Some(tok),
-            )),
-        })
+    fn query() -> impl Parser<'a, I, Query, Err<'a>> + Clone {
+        let capture = select! {
+            Token::Capture(c) => c
+        }
         .labelled("capture");
 
-        let string = filter_map(|span, tok| match tok {
-            Token::Str(s) => Ok(s),
-            _ => Err(Simple::expected_input_found(
-                span,
-                vec![Some(Token::Str(Str(String::from("_"))))],
-                Some(tok),
-            )),
-        })
+        let string = select! {
+            Token::Str(s) => s,
+        }
         .labelled("string");
 
         let predicate = {
-            let predicate_name = filter_map(|span, tok| match tok {
-                Token::PredicateName(p) => Ok(p),
-                _ => Err(Simple::expected_input_found(
-                    span,
-                    vec![Some(Token::PredicateName(PredicateName(String::from("_"))))],
-                    Some(tok),
-                )),
-            })
+            let predicate_name = select! {
+                Token::PredicateName(p) => p,
+            }
             .labelled("predicate name");
 
-            let ident = filter_map(|span, tok| match tok {
-                Token::Ident(ident) => Ok(ident),
-                _ => Err(Simple::expected_input_found(
-                    span,
-                    vec![Some(Token::Ident(Ident(String::from("_"))))],
-                    Some(tok),
-                )),
-            })
+            let ident = select! {
+                Token::Ident(ident) => ident,
+            }
             .labelled("identifier");
 
             predicate_name
@@ -567,39 +535,18 @@ impl DslParser {
                         ident.map(PredicateArg::Ident),
                     ))
                     .repeated()
-                    .or_not()
-                    .map(|v| v.unwrap_or_default()),
+                    .collect(),
                 )
                 .map(|(n, a)| Predicate(n, a))
                 .labelled("predicate")
         };
 
         let pattern = recursive(|pattern| {
-            let quantifier = filter_map(|span, tok| match tok {
-                Token::Ctrl(c) => match &c {
-                    '+' => Ok(Quantifier::OneOrMore),
-                    '?' => Ok(Quantifier::ZeroOrOne),
-                    '*' => Ok(Quantifier::ZeroOrMore),
-                    _ => Err(Simple::expected_input_found(
-                        span,
-                        vec![
-                            Some(Token::Ctrl('+')),
-                            Some(Token::Ctrl('?')),
-                            Some(Token::Ctrl('*')),
-                        ],
-                        Some(tok),
-                    )),
-                },
-                _ => Err(Simple::expected_input_found(
-                    span,
-                    vec![
-                        Some(Token::Ctrl('+')),
-                        Some(Token::Ctrl('?')),
-                        Some(Token::Ctrl('*')),
-                    ],
-                    Some(tok),
-                )),
-            })
+            let quantifier = select! {
+                Token::Ctrl(c) if c == '+' => Quantifier::OneOrMore,
+                Token::Ctrl(c) if c == '?' => Quantifier::ZeroOrOne,
+                Token::Ctrl(c) if c == '*' => Quantifier::ZeroOrMore,
+            }
             .labelled("quantifier");
 
             let anonymous_leaf = string
@@ -618,6 +565,7 @@ impl DslParser {
                 .map(AlternationItem::Choice)
                 .or(predicate.clone().map(AlternationItem::Predicate))
                 .repeated()
+                .collect()
                 .delimited_by(just(Token::Ctrl('[')), just(Token::Ctrl(']')))
                 .map(PatternData::Alternation)
                 .labelled("alternation");
@@ -627,19 +575,15 @@ impl DslParser {
                 .map(GroupItem::Pattern)
                 .or(predicate.clone().map(GroupItem::Predicate))
                 .repeated()
+                .collect()
                 .delimited_by(just(Token::Ctrl('(')), just(Token::Ctrl(')')))
                 .map(PatternData::Group)
                 .labelled("group");
 
             let named_node = {
-                let ident = filter_map(|span, tok| match tok {
-                    Token::Ident(i) => Ok(i),
-                    _ => Err(Simple::expected_input_found(
-                        span,
-                        vec![Some(Token::Ident(Ident(String::from("_"))))],
-                        Some(tok),
-                    )),
-                });
+                let ident = select! {
+                    Token::Ident(i) => i
+                };
 
                 let node_name = ident.clone().labelled("node name");
 
@@ -671,6 +615,7 @@ impl DslParser {
                             )))
                             .map(|(a, i)| AnchoredNamedNodeItem(a, i))
                             .repeated()
+                            .collect()
                             .then(anchor.clone().or_not()),
                     )
                     .delimited_by(just(Token::Ctrl('(')), just(Token::Ctrl(')')))
@@ -694,25 +639,25 @@ impl DslParser {
         pattern
             .map(QueryItem::Pattern)
             .or(predicate.map(QueryItem::Predicate))
-            .recover_with(nested_delimiters(
+            .recover_with(via_parser(nested_delimiters(
                 Token::Ctrl('('),
                 Token::Ctrl(')'),
                 [(Token::Ctrl('['), Token::Ctrl(']'))],
                 |_| QueryItem::Invalid,
-            ))
-            .recover_with(nested_delimiters(
+            )))
+            .recover_with(via_parser(nested_delimiters(
                 Token::Ctrl('['),
                 Token::Ctrl(']'),
                 [(Token::Ctrl('('), Token::Ctrl(')'))],
                 |_| QueryItem::Invalid,
-            ))
+            )))
             .repeated()
-            .or_not()
-            .map(|items| Query(items.unwrap_or_default()))
+            .collect()
+            .map(Query)
             .labelled("query")
     }
 
-    fn match_action() -> impl Parser<Token, MatchAction, Error = Simple<Token>> + Clone {
+    fn match_action() -> impl Parser<'a, I, MatchAction, Err<'a>> + Clone {
         choice((
             Self::replacement()
                 .labelled("replacement")
@@ -721,21 +666,19 @@ impl DslParser {
         ))
     }
 
-    fn match_<'a>(
-        &'a self,
-    ) -> impl Parser<Token, Option<Match>, Error = Simple<Token>> + Clone + 'a {
+    fn match_(&self) -> impl Parser<'a, I, Option<Match>, Err<'a>> + Clone + '_ {
         just(Token::Keyword(Keyword::Match))
             .ignore_then(
                 Self::query()
-                    .validate(|query, span, emit| {
+                    .validate(|query, span, emitter| {
                         if query.0.iter().any(|item| item == &QueryItem::Invalid) {
-                            emit(Simple::custom(span, "malformatted query"));
+                            emitter.emit(Rich::custom(span, "malformatted query"));
                             None
                         } else {
                             TsQuery::new(self.language, &query.to_string())
                                 .map(Some)
                                 .unwrap_or_else(|e| {
-                                    emit(Simple::custom(
+                                    emitter.emit(Rich::custom(
                                         span,
                                         format!("malformatted query: {}", e),
                                     ));
@@ -746,25 +689,24 @@ impl DslParser {
                     .labelled("query"),
             )
             .then(Self::match_action().labelled("action"))
-            .map(|(query, replacement)| query.map(|query| Match::new(query, replacement)))
+            .map(|(query, action)| query.map(|query| Match::new(query, action)))
     }
 
-    fn statement<'a>(
-        &'a self,
-    ) -> impl Parser<Token, Statement, Error = Simple<Token>> + Clone + 'a {
+    fn statement(&self) -> impl Parser<'a, I, Statement, Err<'a>> + Clone + '_ {
         self.match_()
             .then_ignore(just(Token::Ctrl(';')))
-            .validate(|m, span, emit| {
+            .validate(|m, span, emitter| {
                 m.map(|m| Statement::Match(m)).unwrap_or_else(|| {
-                    emit(Simple::custom(span, "invalid match"));
+                    emitter.emit(Rich::custom(span, "invalid match"));
                     Statement::Invalid
                 })
             })
     }
 
-    fn script<'a>(&'a self) -> impl Parser<Token, Script, Error = Simple<Token>> + Clone + 'a {
+    fn script(&self) -> impl Parser<'a, I, Script, Err<'a>> + Clone + '_ {
         self.statement()
             .repeated()
+            .collect()
             .then_ignore(end())
             .map(Script::new)
     }
@@ -776,18 +718,22 @@ impl Parsable for Script {
         language: Language,
         config: ariadne::Config,
     ) -> (Option<Script>, Vec<Report<'b>>) {
-        let (tokens, errs) = lexer().parse_recovery(source);
+        let (tokens, errs) = lexer().parse(source).into_output_errors();
 
         let (script, parse_errs) = if let Some(tokens) = tokens {
-            let parser = DslParser { language };
+            let parser = DslParser {
+                language,
+                marker: Default::default(),
+            };
 
-            let len = source.chars().count();
-            let (ast, parse_errs) = parser.script().parse_recovery(Stream::from_iter(
-                len..len + 1,
-                tokens
-                    .into_iter()
-                    .filter(|(token, _)| !matches!(token, Token::Comment)),
-            ));
+            let token_iter = tokens
+                .into_iter()
+                .filter(|(token, _)| !matches!(token, Token::Comment));
+
+            let token_stream =
+                Stream::from_iter(token_iter).spanned((source.len()..source.len()).into());
+
+            let (ast, parse_errs) = parser.script().parse(token_stream).into_output_errors();
 
             if let Some(script) = ast.filter(|_| errs.len() + parse_errs.len() == 0) {
                 (Some(script), parse_errs)
@@ -800,76 +746,22 @@ impl Parsable for Script {
 
         let reports: Vec<_> = errs
             .into_iter()
-            .map(|e| e.map(|c| c.to_string()))
-            .chain(parse_errs.into_iter().map(|e| e.map(|tok| tok.to_string())))
+            .map(|e| e.map_token(|c| c.to_string()))
+            .chain(
+                parse_errs
+                    .into_iter()
+                    .map(|e| e.map_token(|tok| tok.to_string())),
+            )
             .map(|e| {
-                let report =
-                    Report::build(ReportKind::Error, (), e.span().start).with_config(config);
-
-                let report = match e.reason() {
-                    chumsky::error::SimpleReason::Unclosed { span, delimiter } => report
-                        .with_message(format!(
-                            "Unclosed delimiter {}",
-                            delimiter.fg(Color::Yellow)
-                        ))
-                        .with_label(
-                            Label::new(span.clone())
-                                .with_message(format!(
-                                    "Unclosed delimiter {}",
-                                    delimiter.fg(Color::Yellow)
-                                ))
-                                .with_color(Color::Yellow),
-                        )
-                        .with_label(
-                            Label::new(e.span())
-                                .with_message(format!(
-                                    "Must be closed before this {}",
-                                    e.found()
-                                        .unwrap_or(&"end of file".to_string())
-                                        .fg(Color::Red)
-                                ))
-                                .with_color(Color::Red),
-                        ),
-                    chumsky::error::SimpleReason::Unexpected => report
-                        .with_message(format!(
-                            "{}, expected {}",
-                            if e.found().is_some() {
-                                "Unexpected token in input"
-                            } else {
-                                "Unexpected end of input"
-                            },
-                            if e.expected().len() == 0 {
-                                "something else".to_string()
-                            } else {
-                                e.expected()
-                                    .map(|expected| match expected {
-                                        Some(expected) => expected.to_string(),
-                                        None => "end of input".to_string(),
-                                    })
-                                    .collect::<Vec<_>>()
-                                    .join(", ")
-                            }
-                        ))
-                        .with_label(
-                            Label::new(e.span())
-                                .with_message(format!(
-                                    "Unexpected token {}",
-                                    e.found()
-                                        .unwrap_or(&"end of file".to_string())
-                                        .fg(Color::Red)
-                                ))
-                                .with_color(Color::Red),
-                        ),
-                    chumsky::error::SimpleReason::Custom(msg) => {
-                        report.with_message(msg).with_label(
-                            Label::new(e.span())
-                                .with_message(format!("{}", msg.fg(Color::Red)))
-                                .with_color(Color::Red),
-                        )
-                    }
-                };
-
-                report.finish()
+                Report::build(ReportKind::Error, (), e.span().start)
+                    .with_config(config)
+                    .with_message(e.to_string())
+                    .with_label(
+                        Label::new(e.span().into_range())
+                            .with_message(e.reason().to_string())
+                            .with_color(Color::Red),
+                    )
+                    .finish()
             })
             .collect();
 

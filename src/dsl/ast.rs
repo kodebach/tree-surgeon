@@ -1,9 +1,10 @@
 use std::ops::Range;
 
+use chumsky::span::SimpleSpan;
 use strum::{AsRefStr, EnumIter, EnumString};
 use tree_sitter::Query;
 
-pub type Span = std::ops::Range<usize>;
+pub type Span = SimpleSpan;
 pub type Spanned<T> = (T, Span);
 
 #[derive(Eq, PartialEq, Hash, Clone, Copy, Debug, EnumIter, EnumString, AsRefStr)]
