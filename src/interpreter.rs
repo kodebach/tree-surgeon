@@ -20,9 +20,9 @@ use tree_sitter::{
 use crate::{
     dsl::{
         ast::{
-            ContainsExpr, EqualsExpr, Insert, InsertLocation, JoinItem, Match,
-            MatchAction, MatchClause, Remove, Replace, Script, Statement, StringExpression, Warn,
-            WhereExpr,
+            AndExpr, ContainsExpr, EqualsExpr, Insert, InsertLocation, JoinItem, Match,
+            MatchAction, MatchClause, NotExpr, OrExpr, Remove, Replace, Script, Statement,
+            StringExpression, Warn, WhereExpr,
         },
         parser::Parsable,
     },
@@ -540,9 +540,7 @@ fn execute_match_on_tree(
                 MatchAction::Warn(warn) => {
                     execute_warn(warn, &query_match, cache, &old_source, config)
                 }
-                MatchAction::Remove(remove) => {
-                    execute_remove(remove, &query_match, get_src)
-                }
+                MatchAction::Remove(remove) => execute_remove(remove, &query_match, get_src),
                 MatchAction::Insert(insert) => {
                     execute_insert(insert, &query_match, get_src, &old_source)
                 }
@@ -751,11 +749,7 @@ where
     })
 }
 
-fn execute_remove<F>(
-    remove: &Remove,
-    query_match: &QueryMatch,
-    get_src: F,
-) -> MatchResult
+fn execute_remove<F>(remove: &Remove, query_match: &QueryMatch, get_src: F) -> MatchResult
 where
     F: FnOnce() -> Result<NamedSource, MatchError>,
 {
@@ -1053,6 +1047,15 @@ fn evaluate_where(
             };
 
             Ok(contains)
+        }
+        WhereExpr::And(AndExpr { left, right }) => {
+            Ok(evaluate_where(left, captures, source)? && evaluate_where(right, captures, source)?)
+        }
+        WhereExpr::Or(OrExpr { left, right }) => {
+            Ok(evaluate_where(left, captures, source)? || evaluate_where(right, captures, source)?)
+        }
+        WhereExpr::Not(NotExpr(inner)) => {
+            evaluate_where(inner, captures, source).map(std::ops::Not::not)
         }
     };
 }

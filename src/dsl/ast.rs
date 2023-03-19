@@ -50,6 +50,9 @@ pub enum MatchClause {
 pub enum WhereExpr {
     Equals(EqualsExpr),
     Contains(ContainsExpr),
+    And(AndExpr),
+    Or(OrExpr),
+    Not(NotExpr),
 }
 
 #[derive(Debug)]
@@ -57,6 +60,21 @@ pub struct EqualsExpr {
     pub left: StringExpression,
     pub right: StringExpression,
 }
+
+#[derive(Debug)]
+pub struct AndExpr {
+    pub left: Box<WhereExpr>,
+    pub right: Box<WhereExpr>,
+}
+
+#[derive(Debug)]
+pub struct OrExpr {
+    pub left: Box<WhereExpr>,
+    pub right: Box<WhereExpr>,
+}
+
+#[derive(Debug)]
+pub struct NotExpr(pub Box<WhereExpr>);
 
 #[derive(Debug)]
 pub struct ContainsExpr {

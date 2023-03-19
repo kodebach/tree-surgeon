@@ -396,10 +396,37 @@ where
     }
 
     fn where_expr(&self) -> impl Parser<'a, I, WhereExpr, Err<'a>> + Clone + '_ {
-        choice((
-            Self::equals_expr().map(WhereExpr::Equals),
-            self.contains_expr().map(WhereExpr::Contains),
-        ))
+        recursive(|where_expr| {
+            let atom = choice((
+                Self::equals_expr().map(WhereExpr::Equals),
+                self.contains_expr().map(WhereExpr::Contains),
+                where_expr.delimited_by(just(Token::LParen), just(Token::RParen)),
+            ));
+
+            let not = just(Token::Not)
+                .repeated()
+                .foldr(atom, |_, expr| WhereExpr::Not(NotExpr(Box::new(expr))));
+
+            let and =
+                not.clone()
+                    .foldl(just(Token::And).then(not).repeated(), |left, (_, right)| {
+                        WhereExpr::And(AndExpr {
+                            left: Box::new(left),
+                            right: Box::new(right),
+                        })
+                    });
+
+            let or = and
+                .clone()
+                .foldl(just(Token::Or).then(and).repeated(), |left, (_, right)| {
+                    WhereExpr::Or(OrExpr {
+                        left: Box::new(left),
+                        right: Box::new(right),
+                    })
+                });
+
+            or
+        })
     }
 
     fn match_clause(&self) -> impl Parser<'a, I, MatchClause, Err<'a>> + Clone + '_ {

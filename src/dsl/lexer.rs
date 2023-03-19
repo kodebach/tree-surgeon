@@ -39,6 +39,12 @@ pub enum Token<'a> {
     Before,
     #[token("after")]
     After,
+    #[token("and")]
+    And,
+    #[token("or")]
+    Or,
+    #[token("not")]
+    Not,
 
     // control chars
     #[token("(")]
