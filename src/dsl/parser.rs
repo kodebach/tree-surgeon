@@ -1,13 +1,10 @@
-use logos::Logos;
-
-use std::marker::PhantomData;
-
 use ariadne::{Color, Label, Report, ReportKind};
-
 use chumsky::{
-    input::{Stream, ValueInput},
+    input::{SliceInput, ValueInput},
     prelude::*,
 };
+use logos::Logos;
+use std::{fmt::Write, marker::PhantomData};
 use tree_sitter::{Language, Query as TsQuery};
 
 use super::{ast::*, lexer::Token, query::*};
@@ -22,19 +19,18 @@ pub trait Parsable: Sized {
     ) -> (Option<Script>, Vec<Report<'b>>);
 }
 
-struct DslParser<'a, I>
-where
-    I: ValueInput<'a, Token = Token<'a>, Span = SimpleSpan>,
-{
+struct DslParser<'a, I> {
+    source: &'a str,
     language: Language,
-    marker: PhantomData<&'a I>,
+    marker: PhantomData<I>,
 }
 
 type Err<'a> = extra::Err<Rich<'a, Token<'a>>>;
 
 impl<'a, I> DslParser<'a, I>
 where
-    I: ValueInput<'a, Token = Token<'a>, Span = SimpleSpan>,
+    I: ValueInput<'a, Token = Token<'a>, Span = SimpleSpan>
+        + SliceInput<'a, Slice = &'a [(Token<'a>, SimpleSpan)]>,
 {
     fn capture() -> impl Parser<'a, I, &'a str, Err<'a>> + Clone {
         select! {
@@ -81,25 +77,23 @@ where
             .then_ignore(just(Token::Colon))
             .then(index.clone().or_not())
             .delimited_by(just(Token::LBracket), just(Token::RBracket))
+            .map(|(start, end)| start..end)
             .labelled("index range");
 
-        let capture_expr = Self::capture()
-            .then(recase_suffix.or_not())
-            .then(range_suffix.or_not());
+        let capture_expr = group((
+            Self::capture().map(ToString::to_string),
+            recase_suffix.or_not(),
+            range_suffix.or_not(),
+        ))
+        .map(|(capture_name, target_case, range)| CaptureExpr {
+            capture_name,
+            target_case,
+            range,
+        });
 
         choice((
             Self::string_literal().map(JoinItem::Literal),
-            capture_expr.map(|((capture, case), range)| {
-                if let Some((from, to)) = range {
-                    JoinItem::CaptureExpr(CaptureExpr::new(
-                        capture.to_string(),
-                        case,
-                        Some(from..to),
-                    ))
-                } else {
-                    JoinItem::CaptureExpr(CaptureExpr::new(capture.to_string(), case, None))
-                }
-            }),
+            capture_expr.map(JoinItem::CaptureExpr),
         ))
         .repeated()
         .collect()
@@ -119,24 +113,40 @@ where
 
     fn replacement() -> impl Parser<'a, I, Replace, Err<'a>> + Clone {
         just(Token::Replace)
-            .ignore_then(Self::capture().labelled("capture reference"))
+            .ignore_then(
+                Self::capture()
+                    .map(ToString::to_string)
+                    .labelled("capture reference"),
+            )
             .then(choice((
                 just(Token::With)
                     .ignore_then(Self::string_literal())
                     .map(StringExpression::Literal),
                 just(Token::By).ignore_then(Self::string_expression()),
             )))
-            .map(|(capture, replacement)| Replace::new(capture.to_string(), replacement))
+            .map(|(capture_name, replacement)| Replace {
+                capture_name,
+                replacement,
+            })
     }
 
     fn warning() -> impl Parser<'a, I, Warn, Err<'a>> + Clone {
         just(Token::Warn)
-            .ignore_then(Self::capture().labelled("capture reference"))
+            .ignore_then(
+                Self::capture()
+                    .map(ToString::to_string)
+                    .labelled("capture reference"),
+            )
             .then(Self::string_expression())
-            .map(|(capture, string_expr)| Warn::new(capture.to_string(), string_expr))
+            .map(|(capture_name, message)| Warn {
+                capture_name,
+                message,
+            })
     }
 
-    fn query() -> impl Parser<'a, I, Query, Err<'a>> + Clone {
+    fn query(&self) -> impl Parser<'a, I, Query, Err<'a>> + Clone + '_ {
+        // TODO: better recovery
+
         let capture = select! {
             Token::Capture(c) => c
         }
@@ -278,25 +288,77 @@ where
             .labelled("pattern")
         });
 
-        pattern
-            .map(QueryItem::Pattern)
-            .or(predicate.map(QueryItem::Predicate))
-            .recover_with(via_parser(nested_delimiters(
-                Token::LParen,
-                Token::RParen,
-                [(Token::LBracket, Token::RBracket)],
-                |_| QueryItem::Invalid,
-            )))
-            .recover_with(via_parser(nested_delimiters(
-                Token::LBracket,
-                Token::RBracket,
-                [(Token::LParen, Token::RParen)],
-                |_| QueryItem::Invalid,
-            )))
-            .repeated()
-            .collect()
-            .map(|items| Query { items })
-            .labelled("query")
+        choice((
+            pattern.map(QueryItem::Pattern),
+            predicate.map(QueryItem::Predicate),
+        ))
+        .repeated()
+        .at_least(1)
+        .collect::<Vec<QueryItem>>()
+        .slice()
+        .validate(|tokens: &[(Token, SimpleSpan)], span, emitter| {
+            /*let text = tokens
+            .iter()
+            .map(|(t, _)| t.to_string())
+            .intersperse(" ".to_string())
+            .collect::<String>();*/
+
+            let range = tokens.first().unwrap().1.start..tokens.last().unwrap().1.end;
+            let text = &self.source[range];
+
+            TsQuery::new(self.language, text)
+                .map(Query::Query)
+                .unwrap_or_else(|e| {
+                    emitter.emit(Rich::custom(span, format!("malformatted query: {}", e)));
+                    Query::Invalid
+                })
+        })
+        .recover_with(via_parser(nested_delimiters(
+            Token::LParen,
+            Token::RParen,
+            [(Token::LBracket, Token::RBracket)],
+            |_| Query::Invalid,
+        )))
+        .recover_with(via_parser(nested_delimiters(
+            Token::LBracket,
+            Token::RBracket,
+            [(Token::LParen, Token::RParen)],
+            |_| Query::Invalid,
+        )))
+        .recover_with(skip_until(
+            any().ignored(),
+            one_of([Token::RParen, Token::RBracket]).ignored(),
+            || Query::Invalid,
+        ))
+    }
+
+    fn remove() -> impl Parser<'a, I, Remove, Err<'a>> + Clone {
+        group((
+            just(Token::Remove).ignored(),
+            Self::capture()
+                .map(ToString::to_string)
+                .labelled("capture reference"),
+        ))
+        .map(|(_, capture_name)| Remove { capture_name })
+    }
+
+    fn insert() -> impl Parser<'a, I, Insert, Err<'a>> + Clone {
+        group((
+            just(Token::Insert).ignored(),
+            choice((
+                just(Token::After).to(InsertLocation::After),
+                just(Token::Before).to(InsertLocation::Before),
+            )),
+            Self::capture()
+                .map(ToString::to_string)
+                .labelled("capture reference"),
+            Self::string_expression().labelled("insertion"),
+        ))
+        .map(|(_, location, capture_name, insertion)| Insert {
+            location,
+            capture_name,
+            insertion,
+        })
     }
 
     fn match_action() -> impl Parser<'a, I, MatchAction, Err<'a>> + Clone {
@@ -305,6 +367,8 @@ where
                 .labelled("replacement")
                 .map(MatchAction::Replace),
             Self::warning().labelled("warning").map(MatchAction::Warn),
+            Self::remove().labelled("remove").map(MatchAction::Remove),
+            Self::insert().labelled("insert").map(MatchAction::Insert),
         ))
     }
 
@@ -317,63 +381,59 @@ where
         .map(|(left, _, right)| EqualsExpr { left, right })
     }
 
-    fn where_expr() -> impl Parser<'a, I, WhereExpr, Err<'a>> + Clone {
-        choice((Self::equals_expr().map(WhereExpr::Equals),))
+    fn contains_expr(&self) -> impl Parser<'a, I, ContainsExpr, Err<'a>> + Clone + '_ {
+        group((
+            Self::capture()
+                .map(ToString::to_string)
+                .labelled("capture name"),
+            just(Token::Contains).ignored(),
+            self.query().labelled("query"),
+        ))
+        .map(|(capture_name, _, query)| ContainsExpr {
+            capture_name,
+            query,
+        })
     }
 
-    fn match_clause() -> impl Parser<'a, I, MatchClause, Err<'a>> + Clone {
+    fn where_expr(&self) -> impl Parser<'a, I, WhereExpr, Err<'a>> + Clone + '_ {
+        choice((
+            Self::equals_expr().map(WhereExpr::Equals),
+            self.contains_expr().map(WhereExpr::Contains),
+        ))
+    }
+
+    fn match_clause(&self) -> impl Parser<'a, I, MatchClause, Err<'a>> + Clone + '_ {
         choice((just(Token::Where)
-            .ignore_then(Self::where_expr())
+            .ignore_then(self.where_expr())
             .labelled("where")
             .map(MatchClause::Where),))
     }
 
-    fn match_(&self) -> impl Parser<'a, I, Option<Match>, Err<'a>> + Clone + '_ {
+    fn match_(&self) -> impl Parser<'a, I, Match, Err<'a>> + Clone + '_ {
         group((
             just(Token::Match).ignored(),
-            Self::query()
-                .validate(|query, span, emitter| {
-                    if query.items.iter().any(|item| item == &QueryItem::Invalid) {
-                        emitter.emit(Rich::custom(span, "malformatted query"));
-                        None
-                    } else {
-                        TsQuery::new(self.language, &query.to_string())
-                            .map(Some)
-                            .unwrap_or_else(|e| {
-                                emitter
-                                    .emit(Rich::custom(span, format!("malformatted query: {}", e)));
-                                None
-                            })
-                    }
-                })
-                .labelled("query"),
-            Self::match_clause()
+            self.query().labelled("query"),
+            self.match_clause()
                 .repeated()
                 .collect()
                 .labelled("extra clauses"),
             Self::match_action().labelled("action"),
         ))
-        .map(|(_, query, clauses, action)| {
-            query.map(|query| Match {
-                query,
-                clauses,
-                action,
-            })
+        .map(|(_, query, clauses, action)| Match {
+            query,
+            clauses,
+            action,
         })
     }
 
     fn statement(&self) -> impl Parser<'a, I, Statement, Err<'a>> + Clone + '_ {
         self.match_()
             .then_ignore(just(Token::Semicolon))
-            .validate(|m, span, emitter| {
-                m.map(|m| Statement::Match(m)).unwrap_or_else(|| {
-                    emitter.emit(Rich::custom(span, "invalid match"));
-                    Statement::Invalid
-                })
-            })
-            .recover_with(skip_then_retry_until(
+            .map(Statement::Match)
+            .recover_with(skip_until(
                 any().ignored(),
                 just(Token::Semicolon).ignored(),
+                || Statement::Invalid,
             ))
     }
 
@@ -382,7 +442,7 @@ where
             .repeated()
             .collect()
             .then_ignore(end())
-            .map(Script::new)
+            .map(|statements| Script { statements })
     }
 }
 
@@ -393,28 +453,39 @@ impl Parsable for Script {
         config: ariadne::Config,
     ) -> (Option<Script>, Vec<Report<'b>>) {
         let parser = DslParser {
+            source,
             language,
             marker: Default::default(),
         };
 
-        let tokens: Vec<_> = Token::lexer(source).spanned().collect();
-
-        // eprintln!("{:?}", tokens);
-
-        let token_iter = tokens
-            .into_iter()
+        let tokens = Token::lexer(source)
+            .spanned()
             .filter(|(token, _)| !matches!(token, Token::Comment))
-            .map(|(tok, span)| (tok, SimpleSpan::from(span)));
+            .map(|(tok, span)| (tok, SimpleSpan::from(span)))
+            .collect::<Vec<_>>();
+
+        if false {
+            for (token, span) in tokens.iter() {
+                eprintln!("{}: {:?}", span, token);
+            }
+        }
 
         let eoi = SimpleSpan::new(source.len(), source.len());
 
-        let token_stream = Stream::from_iter(token_iter).spanned(eoi);
+        let token_input = tokens.as_slice().spanned(eoi);
 
-        let (script, parse_errs) = parser.script().parse(token_stream).into_output_errors();
+        let (script, parse_errs) = parser.script().parse(token_input).into_output_errors();
 
         let reports: Vec<_> = parse_errs
             .into_iter()
-            .map(|e| e.map_token(|tok| tok.to_string()))
+            .map(|e| {
+                e.map_token(|tok| {
+                    let mut s = String::new();
+                    s.write_fmt(format_args!("{:?}", tok))
+                        .expect("Debug implementation failed");
+                    s
+                })
+            })
             .map(|e| {
                 Report::build(ReportKind::Error, (), e.span().start)
                     .with_config(config)

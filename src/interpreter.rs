@@ -4,6 +4,7 @@ use std::{
     collections::{HashMap, HashSet},
     fs,
     io::{self, Read, Write},
+    iter::once,
     ops::{Index, Neg, Range},
     path::{Path, PathBuf},
 };
@@ -19,8 +20,9 @@ use tree_sitter::{
 use crate::{
     dsl::{
         ast::{
-            EqualsExpr, JoinItem, Match, MatchAction, MatchClause, Replace, Script, Statement,
-            StringExpression, Warn, WhereExpr,
+            ContainsExpr, EqualsExpr, Insert, InsertLocation, JoinItem, Match,
+            MatchAction, MatchClause, Remove, Replace, Script, Statement, StringExpression, Warn,
+            WhereExpr,
         },
         parser::Parsable,
     },
@@ -83,7 +85,9 @@ impl Cache<PathBuf> for FileCache {
     fn fetch(&mut self, id: &PathBuf) -> Result<&Source, Box<dyn std::fmt::Debug + '_>> {
         if id == &self.file {
             if !self.source.filled() {
-                self.source.fill(Source::from(String::from_utf8_lossy(&self.bytes.borrow()))).unwrap();
+                self.source
+                    .fill(Source::from(String::from_utf8_lossy(&self.bytes.borrow())))
+                    .unwrap();
             }
 
             Ok(&self.source.borrow().unwrap())
@@ -236,6 +240,12 @@ enum MatchError {
     #[error("{0}")]
     #[diagnostic(code(tree_surgeon::r#match::predicate_error))]
     PredicateError(String),
+    #[error("interpreter received invalid query")]
+    #[diagnostic(code(tree_surgeon::r#match::invalid_query))]
+    InvalidQuery,
+    #[error("Unknown predicate: {0}")]
+    #[diagnostic(code(tree_surgeon::r#match::unknown_predicate))]
+    UnknownPredicate(String),
 }
 
 #[derive(Diagnostic, Debug, thiserror::Error)]
@@ -337,7 +347,7 @@ fn parse_source(
     log_level: LogLevel,
     old_tree: Option<&Tree>,
     config: ariadne::Config,
-) -> (Option<Tree>, Vec<Report<'static, FileSpan>>) {
+) -> WithReports<Option<Tree>> {
     let file = cache.file().to_path_buf();
     let tree = parser.parse(cache.bytes().get(), old_tree);
 
@@ -384,7 +394,10 @@ fn parse_source(
             )
         }
 
-        (Some(tree), errors)
+        WithReports {
+            data: Some(tree),
+            reports: errors,
+        }
     } else {
         if log_level <= LogLevel::Error {
             let error = Report::build(ReportKind::Error, file.clone(), 0)
@@ -392,9 +405,15 @@ fn parse_source(
                 .with_message("tree-sitter couldn't parse source file")
                 .finish();
 
-            (None, vec![error])
+            WithReports {
+                data: None,
+                reports: vec![error],
+            }
         } else {
-            (None, Vec::new())
+            WithReports {
+                data: None,
+                reports: Vec::default(),
+            }
         }
     }
 }
@@ -405,29 +424,50 @@ struct TreeEdit {
     new_text: String,
 }
 
-#[derive(Default, Debug)]
-struct ResultData {
-    tree_edit: Option<TreeEdit>,
-    reports: Vec<Report<'static, FileSpan>>,
+trait WithReportsData {
+    fn combine(&mut self, second: Self);
 }
 
-impl ResultData {
-    fn chain<F, E>(self, next: F) -> Result<Self, E>
-    where
-        F: FnOnce() -> Result<Self, E>,
-    {
-        if self.tree_edit.is_some() {
-            Ok(self)
-        } else {
-            let mut result = next()?;
-            result.reports.splice(0..0, self.reports);
-            Ok(result)
+impl WithReportsData for Vec<TreeEdit> {
+    fn combine(&mut self, second: Self) {
+        for other in second {
+            let overlap = self.iter().any(|e| {
+                e.edit.start_byte < other.edit.old_end_byte
+                    && other.edit.start_byte < e.edit.old_end_byte
+            });
+
+            if !overlap {
+                self.push(other);
+            }
         }
     }
 }
 
-type MatchResult = Result<ResultData, MatchError>;
-type StatementResult = Result<ResultData, StatementError>;
+#[derive(Default, Debug)]
+struct WithReports<T> {
+    data: T,
+    reports: Vec<Report<'static, FileSpan>>,
+}
+
+impl<T: WithReportsData> WithReports<T> {
+    fn chain<F, E>(mut self, next: F) -> Result<Self, E>
+    where
+        F: FnOnce() -> Result<Self, E>,
+    {
+        let result = next()?;
+
+        self.data.combine(result.data);
+        self.reports.extend(result.reports);
+
+        Ok(WithReports {
+            data: self.data,
+            reports: self.reports,
+        })
+    }
+}
+
+type MatchResult = Result<WithReports<Vec<TreeEdit>>, MatchError>;
+type StatementResult = Result<WithReports<Vec<TreeEdit>>, StatementError>;
 
 fn execute_match_in_macros(
     m: &Match,
@@ -442,35 +482,31 @@ fn execute_match_in_macros(
 
     let macros = get_matches(&macro_query, &[], tree, cache.bytes().get())?;
 
-    let mut reports = Vec::default();
+    macros
+        .iter()
+        .try_fold(WithReports::default(), |result, query_match| {
+            result.chain(|| {
+                let node = query_match.captures.get("macro").expect("@macro not found");
+                let macro_cache = MacroCache::new(cache.clone(), node.byte_range());
 
-    for query_match in macros {
-        let node = query_match.captures.get("macro").expect("@macro not found");
+                let WithReports {
+                    data: tree,
+                    reports,
+                } = parse_source(parser, &macro_cache, log_level, None, config);
 
-        let macro_cache = MacroCache::new(cache.clone(), node.byte_range());
-
-        let (tree, mut new_reports) = parse_source(parser, &macro_cache, log_level, None, config);
-
-        reports.append(&mut new_reports);
-
-        let mut edit = if let Some(tree) = tree {
-            execute_match_on_tree(m, &macro_cache, &tree, config)?
-        } else {
-            // TODO: report unparsed macro?
-            continue;
-        };
-
-        if edit.tree_edit.is_some() {
-            return Ok(edit);
-        }
-
-        reports.append(&mut edit.reports);
-    }
-
-    Ok(ResultData {
-        tree_edit: None,
-        reports,
-    })
+                WithReports {
+                    data: Vec::default(),
+                    reports,
+                }
+                .chain(|| {
+                    if let Some(tree) = tree {
+                        execute_match_on_tree(m, &macro_cache, &tree, config)
+                    } else {
+                        Ok(WithReports::default())
+                    }
+                })
+            })
+        })
 }
 
 fn execute_match_on_tree(
@@ -481,43 +517,37 @@ fn execute_match_on_tree(
 ) -> MatchResult {
     let old_source = cache.bytes().get().to_vec();
 
-    let matches = get_matches(&m.query, &m.clauses, tree, &old_source)?;
-    let result = 'a: {
-        let mut reports = Vec::default();
-
-        for query_match in matches {
-            let mut result = match &m.action {
-                MatchAction::Replace(replacement) => execute_replace(
-                    replacement,
-                    &query_match,
-                    || {
-                        Ok(NamedSource::new(
-                            cache.file().to_string_lossy(),
-                            String::from_utf8(cache.bytes().get().to_vec())
-                                .map_err(MatchError::FromUtf8)?,
-                        ))
-                    },
-                    &old_source,
-                )?,
-                MatchAction::Warn(warn) => {
-                    execute_warn(warn, &query_match, cache, &old_source, config)?
-                }
-            };
-
-            if result.tree_edit.is_some() {
-                break 'a result;
-            }
-
-            reports.append(&mut result.reports);
-        }
-
-        ResultData {
-            tree_edit: None,
-            reports,
-        }
+    let crate::dsl::ast::Query::Query(query) = &m.query else {
+        return Err(MatchError::InvalidQuery)
     };
 
-    Ok(result)
+    let matches = get_matches(query, &m.clauses, tree, &old_source)?;
+
+    let get_src = || {
+        Ok(NamedSource::new(
+            cache.file().to_string_lossy(),
+            String::from_utf8(cache.bytes().get().to_vec()).map_err(MatchError::FromUtf8)?,
+        ))
+    };
+
+    matches
+        .iter()
+        .try_fold(WithReports::default(), |result, query_match| {
+            result.chain(|| match &m.action {
+                MatchAction::Replace(replace) => {
+                    execute_replace(replace, &query_match, get_src, &old_source)
+                }
+                MatchAction::Warn(warn) => {
+                    execute_warn(warn, &query_match, cache, &old_source, config)
+                }
+                MatchAction::Remove(remove) => {
+                    execute_remove(remove, &query_match, get_src)
+                }
+                MatchAction::Insert(insert) => {
+                    execute_insert(insert, &query_match, get_src, &old_source)
+                }
+            })
+        })
 }
 
 fn execute_match(
@@ -533,7 +563,7 @@ fn execute_match(
         if parse_macros {
             execute_match_in_macros(m, parser, cache, tree, log_level, config)
         } else {
-            Ok(ResultData::default())
+            Ok(WithReports::default())
         }
     })
 }
@@ -550,9 +580,8 @@ fn error_ancestor(node: Node) -> Option<Node> {
     }
 }
 
-// TODO: better types
 fn execute_replace<F>(
-    replacement: &Replace,
+    replace: &Replace,
     query_match: &QueryMatch,
     get_src: F,
     source: &[u8],
@@ -560,20 +589,19 @@ fn execute_replace<F>(
 where
     F: FnOnce() -> Result<NamedSource, MatchError>,
 {
-    let node =
-        query_match
-            .captures
-            .get(replacement.capture_name())
-            .ok_or(MatchError::Replacement(ReplacementError::MissingCapture {
-                capture_name: replacement.capture_name().to_string(),
-            }))?;
-
+    let node = query_match
+        .captures
+        .get(&replace.capture_name)
+        .ok_or(MatchError::Replacement(ReplacementError::MissingCapture {
+            capture_name: replace.capture_name.clone(),
+        }))?
+        .to_owned();
     let start_byte = node.start_byte();
     let old_end_byte = node.end_byte();
     let start_position = node.start_position();
     let old_end_position = node.end_position();
 
-    if let Some(error) = error_ancestor(*node) {
+    if let Some(error) = error_ancestor(node) {
         let error_start_byte = error.start_byte();
         let error_end_byte = error.end_byte();
 
@@ -584,8 +612,9 @@ where
             edit_span: (start_byte, old_end_byte - start_byte).into(),
         }));
     }
+
     let new_text = evaluate_string_expression(
-        replacement.replacement(),
+        &replace.replacement,
         |name| {
             query_match
                 .captures
@@ -597,6 +626,7 @@ where
         },
         source,
     )?;
+
     let line_ending_count = new_text.chars().filter(|c| *c == '\n').count();
     let last_line_len = new_text.chars().rev().take_while(|c| *c != '\n').count();
 
@@ -619,8 +649,158 @@ where
         new_text,
     };
 
-    Ok(ResultData {
-        tree_edit: Some(tree_edit),
+    Ok(WithReports {
+        data: vec![tree_edit],
+        reports: Vec::default(),
+    })
+}
+
+fn execute_insert<F>(
+    insert: &Insert,
+    query_match: &QueryMatch,
+    get_src: F,
+    source: &[u8],
+) -> MatchResult
+where
+    F: FnOnce() -> Result<NamedSource, MatchError>,
+{
+    let node = query_match
+        .captures
+        .get(&insert.capture_name)
+        .ok_or(MatchError::Replacement(ReplacementError::MissingCapture {
+            capture_name: insert.capture_name.clone(),
+        }))?
+        .to_owned();
+
+    let start_byte = node.start_byte();
+    let old_end_byte = node.end_byte();
+    let start_position = node.start_position();
+    let old_end_position = node.end_position();
+
+    if let Some(error) = error_ancestor(node) {
+        let error_start_byte = error.start_byte();
+        let error_end_byte = error.end_byte();
+
+        return Err(MatchError::EditInErrorNode(EditInErrorNode {
+            src: get_src()?,
+            error_span: (error_start_byte, error_end_byte - error_start_byte).into(),
+            error_label: error.to_sexp(),
+            edit_span: (start_byte, old_end_byte - start_byte).into(),
+        }));
+    }
+
+    let new_text = evaluate_string_expression(
+        &insert.insertion,
+        |name| {
+            query_match
+                .captures
+                .get(name)
+                .ok_or(MatchError::Replacement(ReplacementError::MissingCapture {
+                    capture_name: name.to_string(),
+                }))
+                .copied()
+        },
+        source,
+    )?;
+
+    let line_ending_count = new_text.chars().filter(|c| *c == '\n').count();
+    let last_line_len = new_text.chars().rev().take_while(|c| *c != '\n').count();
+
+    let tree_edit = match insert.location {
+        InsertLocation::Before => TreeEdit {
+            edit: InputEdit {
+                start_byte,
+                old_end_byte: start_byte,
+                start_position,
+                old_end_position: start_position,
+                new_end_byte: start_byte + new_text.len(),
+                new_end_position: Point {
+                    row: start_position.row + line_ending_count,
+                    column: if line_ending_count == 0 {
+                        start_position.column + new_text.len()
+                    } else {
+                        last_line_len
+                    },
+                },
+            },
+            new_text,
+        },
+        InsertLocation::After => TreeEdit {
+            edit: InputEdit {
+                start_byte: old_end_byte,
+                old_end_byte,
+                start_position: old_end_position,
+                old_end_position,
+                new_end_byte: old_end_byte + new_text.len(),
+                new_end_position: Point {
+                    row: old_end_position.row + line_ending_count,
+                    column: if line_ending_count == 0 {
+                        old_end_position.column + new_text.len()
+                    } else {
+                        last_line_len
+                    },
+                },
+            },
+            new_text,
+        },
+    };
+
+    Ok(WithReports {
+        data: vec![tree_edit],
+        reports: Vec::default(),
+    })
+}
+
+fn execute_remove<F>(
+    remove: &Remove,
+    query_match: &QueryMatch,
+    get_src: F,
+) -> MatchResult
+where
+    F: FnOnce() -> Result<NamedSource, MatchError>,
+{
+    let node = query_match
+        .captures
+        .get(&remove.capture_name)
+        .ok_or(MatchError::Replacement(ReplacementError::MissingCapture {
+            capture_name: remove.capture_name.clone(),
+        }))?
+        .to_owned();
+
+    let start_byte = node.start_byte();
+    let old_end_byte = node.end_byte();
+    let start_position = node.start_position();
+    let old_end_position = node.end_position();
+
+    if let Some(error) = error_ancestor(node) {
+        let error_start_byte = error.start_byte();
+        let error_end_byte = error.end_byte();
+
+        return Err(MatchError::EditInErrorNode(EditInErrorNode {
+            src: get_src()?,
+            error_span: (error_start_byte, error_end_byte - error_start_byte).into(),
+            error_label: error.to_sexp(),
+            edit_span: (start_byte, old_end_byte - start_byte).into(),
+        }));
+    }
+
+    let tree_edit = TreeEdit {
+        edit: InputEdit {
+            start_byte,
+            old_end_byte,
+            start_position,
+            old_end_position,
+            new_end_byte: start_byte,
+            new_end_position: Point {
+                row: start_position.row,
+                column: start_position.column,
+            },
+        },
+        new_text: String::default(),
+    };
+
+    Ok(WithReports {
+        data: vec![tree_edit],
         reports: Vec::default(),
     })
 }
@@ -638,36 +818,34 @@ where
         StringExpression::Join(items) => items
             .iter()
             .map(|item| match item {
-                JoinItem::CaptureExpr(capture_expr) => {
-                    get_capture_node(capture_expr.capture_name())
-                        .and_then(|n| n.utf8_text(source).map_err(MatchError::Utf8))
-                        .map(|text| {
-                            capture_expr
-                                .target_case()
-                                .map_or(text.to_owned(), |case| text.to_case(case.into()))
-                        })
-                        .map(|text| {
-                            capture_expr
-                                .range()
-                                .map(|Range { start, end }| {
-                                    start.map_or(0, |s| {
-                                        if s.is_negative() {
-                                            text.len() - s.neg() as usize
-                                        } else {
-                                            s as usize
-                                        }
-                                    })
-                                        ..end.map_or(text.len(), |e| {
-                                            if e.is_negative() {
-                                                text.len() - e.neg() as usize
-                                            } else {
-                                                e as usize
-                                            }
-                                        })
+                JoinItem::CaptureExpr(capture_expr) => get_capture_node(&capture_expr.capture_name)
+                    .and_then(|n| n.utf8_text(source).map_err(MatchError::Utf8))
+                    .map(|text| {
+                        capture_expr
+                            .target_case
+                            .map_or(text.to_owned(), |case| text.to_case(case.into()))
+                    })
+                    .map(|text| {
+                        capture_expr
+                            .range
+                            .as_ref()
+                            .map(|Range { start, end }| {
+                                start.map_or(0, |s| {
+                                    if s.is_negative() {
+                                        text.len() - s.neg() as usize
+                                    } else {
+                                        s as usize
+                                    }
+                                })..end.map_or(text.len(), |e| {
+                                    if e.is_negative() {
+                                        text.len() - e.neg() as usize
+                                    } else {
+                                        e as usize
+                                    }
                                 })
-                                .map_or(text.to_owned(), |range| (&text[range]).to_owned())
-                        })
-                }
+                            })
+                            .map_or(text.to_owned(), |range| (&text[range]).to_owned())
+                    }),
                 JoinItem::Literal(new_text) => Ok(new_text.to_owned()),
             })
             .collect::<Result<String, _>>()?,
@@ -682,12 +860,12 @@ fn execute_warn(
     source: &[u8],
     config: ariadne::Config,
 ) -> MatchResult {
-    let node = query_match.captures.get(warn.capture_name());
+    let node = query_match.captures.get(&warn.capture_name);
 
-    let Some(node) = node else { return Ok(ResultData::default()); };
+    let Some(node) = node else { return Ok(WithReports::default()); };
 
     let msg = evaluate_string_expression(
-        warn.message(),
+        &warn.message,
         |name| {
             query_match
                 .captures
@@ -712,8 +890,8 @@ fn execute_warn(
             )
             .finish();
 
-    Ok(ResultData {
-        tree_edit: None,
+    Ok(WithReports {
+        data: Vec::default(),
         reports: vec![report],
     })
 }
@@ -722,85 +900,89 @@ struct QueryMatch<'tree> {
     captures: HashMap<String, Node<'tree>>,
 }
 
-fn get_matches<'t>(
+fn evaluate_query_predicates(
     query: &Query,
-    clauses: &[MatchClause],
-    tree: &'t Tree,
+    query_match: &tree_sitter::QueryMatch,
     source: &[u8],
-) -> Result<Vec<QueryMatch<'t>>, MatchError> {
-    let mut cursor = QueryCursor::new();
+) -> Result<bool, MatchError> {
+    query
+        .general_predicates(query_match.pattern_index)
+        .iter()
+        .try_fold(true, |result, predicate| {
+            if !result {
+                return Ok(false);
+            }
 
-    cursor.matches(&query, tree.root_node(), source).try_fold(
-        Vec::default(),
-        |mut matches, query_match| {
-            let predicates_matching = query
-                .general_predicates(query_match.pattern_index)
-                .iter()
-                .try_fold(true, |result, predicate| {
-                    if !result {
-                        return Ok(false);
+            let invert: bool;
+            let name = if predicate.operator.starts_with("not-") {
+                invert = true;
+                &predicate.operator[4..]
+            } else {
+                invert = false;
+                &predicate.operator
+            };
+
+            let matching = match name {
+                "in-list?" => {
+                    if predicate.args.len() < 2 {
+                        return Err(MatchError::PredicateError(
+                            "#in-list? requires at least 2 arguments".to_string(),
+                        ));
                     }
 
-                    let invert: bool;
-                    let name = if predicate.operator.starts_with("not-") {
-                        invert = true;
-                        &predicate.operator[4..]
-                    } else {
-                        invert = false;
-                        &predicate.operator
-                    };
-
-                    let matching = match name {
-                        "in-list?" => {
-                            if predicate.args.len() < 2 {
-                                return Err(MatchError::PredicateError(
-                                    "#in-list? requires at least 2 arguments".to_string(),
-                                ));
-                            }
-
-                            let QueryPredicateArg::Capture(capture) = predicate.args[0] else {
+                    let QueryPredicateArg::Capture(capture) = predicate.args[0] else {
                             return Err(MatchError::PredicateError(
                                 "The first argument to #in-list? must be a capture reference"
                                     .to_string(),
                             ));
                         };
 
-                            let strings: HashSet<&str> = predicate.args[1..]
-                                .iter()
-                                .filter_map(|arg| {
-                                    if let QueryPredicateArg::String(s) = arg {
-                                        Some(s.as_ref())
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .collect();
-
-                            if strings.len() + 1 != predicate.args.len() {
-                                return Err(MatchError::PredicateError(
-                                "All arguments to #in-list? except for the first, must be strings"
-                                    .to_string(),
-                            ));
+                    let strings: HashSet<&str> = predicate.args[1..]
+                        .iter()
+                        .filter_map(|arg| {
+                            if let QueryPredicateArg::String(s) = arg {
+                                Some(s.as_ref())
+                            } else {
+                                None
                             }
+                        })
+                        .collect();
 
-                            let node = query_match
-                                .nodes_for_capture_index(capture)
-                                .single()
-                                .map_err(MatchError::Single)?;
+                    if strings.len() + 1 != predicate.args.len() {
+                        return Err(MatchError::PredicateError(
+                            "All arguments to #in-list? except for the first, must be strings"
+                                .to_string(),
+                        ));
+                    }
 
-                            let node_text = node.utf8_text(source).map_err(MatchError::Utf8)?;
+                    let node = query_match
+                        .nodes_for_capture_index(capture)
+                        .single()
+                        .map_err(MatchError::Single)?;
 
-                            strings.contains(&node_text)
-                        }
-                        s => {
-                            // TODO: report error
-                            eprintln!("unknown predicate {}", s);
-                            false
-                        }
-                    };
+                    let node_text = node.utf8_text(source).map_err(MatchError::Utf8)?;
 
-                    Ok(invert ^ matching)
-                })?;
+                    strings.contains(&node_text)
+                }
+                s => {
+                    return Err(MatchError::UnknownPredicate(s.to_string()));
+                }
+            };
+
+            Ok(invert ^ matching)
+        })
+}
+
+fn get_matches<'t>(
+    query: &Query,
+    clauses: &[MatchClause],
+    tree: &'t Tree,
+    source: &[u8],
+) -> Result<Vec<QueryMatch<'t>>, MatchError> {
+    QueryCursor::new()
+        .matches(&query, tree.root_node(), source)
+        .try_fold(Vec::default(), |mut matches, query_match| {
+            let predicates_matching = evaluate_query_predicates(query, &query_match, source)?;
 
             if !predicates_matching {
                 return Ok(matches);
@@ -810,6 +992,7 @@ fn get_matches<'t>(
                 .captures
                 .iter()
                 .map(|c| (query.capture_names()[c.index as usize].clone(), c.node))
+                .chain(once(("".to_string(), tree.root_node())))
                 .collect();
 
             let clauses_matching = clauses.iter().try_fold(true, |result, clause| {
@@ -828,8 +1011,7 @@ fn get_matches<'t>(
             matches.push(QueryMatch { captures });
 
             Ok(matches)
-        },
-    )
+        })
 }
 
 fn evaluate_where(
@@ -850,6 +1032,27 @@ fn evaluate_where(
             let right = evaluate_string_expression(right, get_capture_node, source)?;
 
             Ok(left == right)
+        }
+        WhereExpr::Contains(ContainsExpr {
+            capture_name,
+            query,
+        }) => {
+            let node = get_capture_node(&capture_name)?;
+
+            let crate::dsl::ast::Query::Query(query) = query else {
+                return Err(MatchError::InvalidQuery)
+            };
+
+            let contains = 'result: {
+                for query_match in QueryCursor::new().matches(query, node, source) {
+                    if evaluate_query_predicates(query, &query_match, source)? {
+                        break 'result true;
+                    }
+                }
+                false
+            };
+
+            Ok(contains)
         }
     };
 }
@@ -881,30 +1084,22 @@ fn execute_script(
     parse_macros: bool,
     config: ariadne::Config,
 ) -> StatementResult {
-    let mut reports = Vec::default();
-
-    for statement in script.statements() {
-        let mut result = execute_statement(
-            statement,
-            parser,
-            cache,
-            tree,
-            log_level,
-            parse_macros,
-            config,
-        )?;
-
-        if result.tree_edit.is_some() {
-            return Ok(result);
-        }
-
-        reports.append(&mut result.reports);
-    }
-
-    Ok(ResultData {
-        tree_edit: None,
-        reports,
-    })
+    script
+        .statements
+        .iter()
+        .try_fold(WithReports::default(), |result, statement| {
+            result.chain(|| {
+                execute_statement(
+                    statement,
+                    parser,
+                    cache,
+                    tree,
+                    log_level,
+                    parse_macros,
+                    config,
+                )
+            })
+        })
 }
 
 impl Interpreter {
@@ -937,7 +1132,10 @@ impl Interpreter {
 
         let cache = FileCache::new(source, source_file);
 
-        let (tree, reports) = parse_source(&mut parser, &cache, log_level, None, config);
+        let WithReports {
+            data: tree,
+            reports,
+        } = parse_source(&mut parser, &cache, log_level, None, config);
 
         for report in reports {
             report.eprint(cache.clone()).into_diagnostic()?;
@@ -954,7 +1152,9 @@ impl Interpreter {
         let (script, reports) = Script::parse(&script_source, tree.language(), config);
 
         for report in reports {
-            report.eprint(Source::from(&script_source)).into_diagnostic()?;
+            report
+                .eprint(Source::from(&script_source))
+                .into_diagnostic()?;
         }
 
         let script = script
@@ -988,30 +1188,37 @@ impl Interpreter {
 
             reports.append(&mut result.reports);
 
-            let Some(TreeEdit { edit, new_text }) = result.tree_edit else {
+            let edits = result.data;
+
+            if edits.is_empty() {
                 break;
-            };
+            }
 
-            self.cache.update(|bytes| {
-                bytes.splice(edit.start_byte..edit.old_end_byte, new_text.bytes());
-            });
-            self.tree.edit(&edit);
+            for TreeEdit { edit, new_text } in edits {
+                self.cache.update(|bytes| {
+                    bytes.splice(edit.start_byte..edit.old_end_byte, new_text.bytes());
+                });
+                self.tree.edit(&edit);
 
-            let (new_tree, mut new_reports) = parse_source(
-                &mut self.parser,
-                &self.cache,
-                self.log_level,
-                Some(&self.tree),
-                self.config,
-            );
+                let WithReports {
+                    data: new_tree,
+                    reports: mut new_reports,
+                } = parse_source(
+                    &mut self.parser,
+                    &self.cache,
+                    self.log_level,
+                    Some(&self.tree),
+                    self.config,
+                );
 
-            reports.append(&mut new_reports);
+                reports.append(&mut new_reports);
 
-            self.tree = new_tree.ok_or(MatchError::Replacement(ReplacementError::TreeParse(
-                TreeParseError {
-                    source_file: self.cache.file().to_owned(),
-                },
-            )))?;
+                self.tree = new_tree.ok_or(MatchError::Replacement(
+                    ReplacementError::TreeParse(TreeParseError {
+                        source_file: self.cache.file().to_owned(),
+                    }),
+                ))?;
+            }
         }
 
         if self.in_place {

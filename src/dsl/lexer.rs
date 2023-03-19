@@ -1,5 +1,3 @@
-use std::fmt::Display;
-
 use logos::{Lexer, Logos};
 
 #[derive(Logos, Debug, Clone, PartialEq)]
@@ -13,9 +11,9 @@ pub enum Token<'a> {
     String(String),
     #[regex(r"[-_[:alpha:]][-_?!.[:alnum:]]*", |lex| lex.slice())]
     Identifier(&'a str),
-    #[regex(r"@[^()\[\]$.\s]+", |lex| &lex.slice()[1..])]
+    #[regex(r"@[-_[:alpha:]]?[-_?!.[:alnum:]]*", |lex| &lex.slice()[1..])]
     Capture(&'a str),
-    #[regex(r"#[^()\[\]$.\s]+", |lex| &lex.slice()[1..])]
+    #[regex(r"#[-_[:alpha:]][-_?!.[:alnum:]]*", |lex| &lex.slice()[1..])]
     PredicateName(&'a str),
 
     // keywords
@@ -31,6 +29,16 @@ pub enum Token<'a> {
     By,
     #[token("where")]
     Where,
+    #[token("contains")]
+    Contains,
+    #[token("remove")]
+    Remove,
+    #[token("insert")]
+    Insert,
+    #[token("before")]
+    Before,
+    #[token("after")]
+    After,
 
     // control chars
     #[token("(")]
@@ -85,58 +93,6 @@ fn parse_string<'a>(lexer: &mut Lexer<'a, Token<'a>>) -> Option<String> {
         })
         .collect::<Result<String, _>>()
         .ok()
-}
-
-impl Display for Token<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Token::Number(s) => write!(f, "{}", s),
-            Token::String(s) => write_string(f, s),
-            Token::Identifier(s) => write!(f, "{}", s),
-            Token::Capture(s) => write!(f, "@{}", s),
-            Token::PredicateName(s) => write!(f, "#{}", s),
-            Token::Match => write!(f, "match"),
-            Token::Replace => write!(f, "replace"),
-            Token::Warn => write!(f, "warn"),
-            Token::With => write!(f, "with"),
-            Token::By => write!(f, "by"),
-            Token::Where => write!(f, "where"),
-            Token::LParen => write!(f, "("),
-            Token::RParen => write!(f, ")"),
-            Token::LBracket => write!(f, "["),
-            Token::RBracket => write!(f, "]"),
-            Token::LBrace => write!(f, "{{"),
-            Token::RBrace => write!(f, "}}"),
-            Token::Dollar => write!(f, "$"),
-            Token::Colon => write!(f, ":"),
-            Token::Plus => write!(f, "+"),
-            Token::Asterisk => write!(f, "*"),
-            Token::QuestionMark => write!(f, "?"),
-            Token::Underscore => write!(f, "_"),
-            Token::Dot => write!(f, "."),
-            Token::Bang => write!(f, "!"),
-            Token::Semicolon => write!(f, ";"),
-            Token::Equals => write!(f, "_"),
-            Token::Comment => Ok(()),
-            Token::Error => Ok(()),
-        }
-    }
-}
-
-fn write_string(f: &mut std::fmt::Formatter<'_>, s: &str) -> std::fmt::Result {
-    write!(f, "\"")?;
-    for c in s.chars() {
-        match c {
-            '\x08' => write!(f, "\\t"),
-            '\x0C' => write!(f, "\\f"),
-            '\n' => write!(f, "\\n"),
-            '\r' => write!(f, "\\r"),
-            '\t' => write!(f, "\\t"),
-            _ if c.is_ascii_graphic() => write!(f, "{}", c),
-            _ => write!(f, "{:04x}", c as u32),
-        }?
-    }
-    write!(f, "\"")
 }
 
 #[derive(Logos, Debug)]

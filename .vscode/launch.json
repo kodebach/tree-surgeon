@@ -95,7 +95,7 @@
             "id": "script_file",
             "type": "promptString",
             "description": "Script Path",
-            "default": "../../uni/msc/paper/scripts/detect_nonthreadsafe.tsg"
+            "default": "../../uni/msc/paper/scripts/headers_split.tsg"
         }
     ]
 }
