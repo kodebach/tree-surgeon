@@ -5,6 +5,14 @@ edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[lib]
+name = "tree_surgeon"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tree-surgeon"
+path = "src/main.rs"
+
 [dependencies]
 anyhow = "1.0.57"
 ariadne = "0.2.0"

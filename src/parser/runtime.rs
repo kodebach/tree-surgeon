@@ -7,13 +7,15 @@ use logos::Logos;
 use std::{fmt::Write, marker::PhantomData};
 use tree_sitter::{Language, Query as TsQuery};
 
-use super::{ast::*, lexer::Token, query::*};
+use super::lexer::*;
+use super::query::*;
+use crate::dsl::ast::*;
 
 trait TokenInput<'a>: ValueInput<'a, Token = Token<'a>, Span = SimpleSpan> {}
 
 pub trait Parsable: Sized {
-    fn parse<'a, 'b>(
-        source: &'a str,
+    fn parse<'b>(
+        source: &str,
         language: Language,
         config: ariadne::Config,
     ) -> (Option<Script>, Vec<Report<'b>>);
@@ -34,7 +36,7 @@ where
 {
     fn capture() -> impl Parser<'a, I, &'a str, Err<'a>> + Clone {
         select! {
-            Token::Capture(name) => name.clone()
+            Token::Capture(name) => name
         }
     }
 
@@ -207,7 +209,7 @@ where
             let alternation = pattern
                 .clone()
                 .map(AlternationItem::Choice)
-                .or(predicate.clone().map(AlternationItem::Predicate))
+                .or(predicate.map(AlternationItem::Predicate))
                 .repeated()
                 .collect()
                 .delimited_by(just(Token::LBracket), just(Token::RBracket))
@@ -217,7 +219,7 @@ where
             let group = pattern
                 .clone()
                 .map(GroupItem::Pattern)
-                .or(predicate.clone().map(GroupItem::Predicate))
+                .or(predicate.map(GroupItem::Predicate))
                 .repeated()
                 .collect()
                 .delimited_by(just(Token::LParen), just(Token::RParen))
@@ -230,9 +232,9 @@ where
                 }
                 .map(ToString::to_string);
 
-                let node_name = ident.clone().labelled("node name");
+                let node_name = ident.labelled("node name");
 
-                let field_name = ident.clone().labelled("field name");
+                let field_name = ident.labelled("field name");
 
                 let anchor = just(Token::Dot).to(Anchor).labelled("anchor");
 
@@ -256,7 +258,7 @@ where
                             .then(choice((
                                 child,
                                 negated_child,
-                                predicate.clone().map(NamedNodeItem::Predicate),
+                                predicate.map(NamedNodeItem::Predicate),
                             )))
                             .map(|(anchor, item)| AnchoredNamedNodeItem {
                                 anchor: anchor.is_some(),
@@ -425,6 +427,7 @@ where
                     })
                 });
 
+            #[allow(clippy::let_and_return)]
             or
         })
     }
@@ -474,8 +477,8 @@ where
 }
 
 impl Parsable for Script {
-    fn parse<'a, 'b>(
-        source: &'a str,
+    fn parse<'b>(
+        source: &str,
         language: Language,
         config: ariadne::Config,
     ) -> (Option<Script>, Vec<Report<'b>>) {
