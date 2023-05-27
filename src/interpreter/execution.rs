@@ -6,10 +6,9 @@ use std::{
     vec,
 };
 
-use ariadne::{Color, Label, Report, ReportKind};
 use convert_case::Casing;
-use miette::{NamedSource, SourceSpan};
-use tree_sitter::{InputEdit, Node, Point, QueryCursor, QueryPredicateArg, Tree};
+use miette::{LabeledSpan, Report, Severity, SourceSpan};
+use tree_sitter::{InputEdit, Node, Point, QueryCursor, QueryPredicateArg, TextProvider, Tree};
 
 use crate::{
     dsl::ast::{
@@ -20,7 +19,7 @@ use crate::{
     single::Single,
 };
 
-use super::cache::{FileCache, FileSpan, SourceCache};
+use super::cache::{FileCache, MacroCache, SourceCache};
 
 struct QueryMatch<'tree> {
     captures: HashMap<String, Node<'tree>>,
@@ -30,16 +29,25 @@ struct QueryMatch<'tree> {
 pub struct TreeEdit {
     edit: InputEdit,
     new_text: String,
+    tree_idx: usize,
 }
 
 impl TreeEdit {
-    pub fn apply(&self, cache: &mut FileCache, tree: &mut Tree) {
-        cache.update(|bytes| {
-            bytes.splice(
-                self.edit.start_byte..self.edit.old_end_byte,
-                self.new_text.bytes(),
-            );
-        });
+    pub fn apply(&self, ctx: &mut ScriptContext) {
+        let edit_range = self.edit.start_byte..self.edit.old_end_byte;
+        let edit_range = if self.tree_idx == 0 {
+            edit_range
+        } else {
+            ctx.macros[self.tree_idx - 1].0.translate_range(edit_range)
+        };
+        ctx.file_cache
+            .apply_edit(edit_range, self.new_text.as_str());
+
+        let tree = if self.tree_idx == 0 {
+            &mut ctx.file_tree
+        } else {
+            &mut ctx.macros[self.tree_idx - 1].1
+        };
         tree.edit(&self.edit);
     }
 }
@@ -47,7 +55,7 @@ impl TreeEdit {
 #[derive(Default)]
 pub struct ExecutionResult {
     pub edits: Vec<TreeEdit>,
-    pub reports: Vec<Report<'static, FileSpan>>,
+    pub reports: Vec<Report>,
 }
 
 impl ExecutionResult {
@@ -74,29 +82,17 @@ pub trait Executable<Ctx> {
 }
 
 pub struct ScriptContext {
-    pub(crate) cache: FileCache,
+    pub(crate) file_cache: FileCache,
     pub(crate) file_tree: Tree,
-    pub(crate) macro_trees: Vec<Tree>,
-    pub(crate) parse_macros: bool,
-    pub(crate) report_config: ariadne::Config,
+    pub(crate) macros: Vec<(MacroCache, Tree)>,
 }
 
-impl ScriptContext {
-    fn named_source(&self) -> Result<NamedSource, std::string::FromUtf8Error> {
-        Ok(NamedSource::new(
-            self.cache.file().to_string_lossy(),
-            String::from_utf8(self.cache.bytes().get().to_vec())?,
-        ))
-    }
-
-    pub fn get_node_string(&self, node: Node) -> Result<&str, std::str::Utf8Error> {
-        self.cache.get_node_string(node)
-    }
-}
-
-struct MatchContext<'a> {
-    #[allow(clippy::redundant_allocation)]
-    script_ctx: Rc<&'a mut ScriptContext>,
+struct MatchContext<'a, C>
+where
+    C: SourceCache,
+{
+    cache: &'a C,
+    tree_idx: usize,
     query_match: &'a QueryMatch<'a>,
 }
 
@@ -133,13 +129,26 @@ pub enum ScriptError {
 #[error("tried to make and edit within an error node")]
 #[diagnostic(code(tree_surgeon::script::replace::edit_in_error))]
 pub struct EditInErrorNodeError {
-    #[source_code]
-    src: NamedSource,
     error_label: String,
     #[label("{error_label}")]
     error_span: SourceSpan,
     #[label("tried to edit this")]
     edit_span: SourceSpan,
+}
+
+impl EditInErrorNodeError {
+    fn new(
+        error_label: String,
+        error_span: SourceSpan,
+        edit_span: SourceSpan,
+        cache: &impl SourceCache,
+    ) -> Self {
+        EditInErrorNodeError {
+            error_label,
+            error_span: cache.translate_span(error_span),
+            edit_span: cache.translate_span(edit_span),
+        }
+    }
 }
 
 impl Executable<ScriptContext> for Script {
@@ -167,6 +176,92 @@ impl Executable<ScriptContext> for Statement {
     }
 }
 
+fn execute_match<C>(
+    mat: &Match,
+    cache: &C,
+    tree_idx: usize,
+    tree: &Tree,
+    query: &tree_sitter::Query,
+    cursor: &mut QueryCursor,
+    result: &mut ExecutionResult,
+) -> Result<(), ScriptError>
+where
+    C: SourceCache,
+    for<'a> &'a C: TextProvider<'a>,
+{
+    let matches = {
+        let clauses = &mat.clauses;
+
+        let mut matches = Vec::default();
+
+        for query_match in cursor.matches(query, tree.root_node(), cache) {
+            let mut captures = HashMap::default();
+
+            let predicates_matching = query
+                .evaluate(&mut QueryContext {
+                    cache,
+                    query_match: &query_match,
+                    captures: &captures,
+                })
+                .map_err(ScriptError::Query)?;
+
+            if !predicates_matching {
+                continue;
+            }
+
+            captures.extend(
+                query_match
+                    .captures
+                    .iter()
+                    .map(|c| (query.capture_names()[c.index as usize].clone(), c.node))
+                    .chain(once(("".to_string(), tree.root_node()))),
+            );
+
+            let clauses_matching = clauses.iter().try_fold(true, |result, clause| {
+                let result = result
+                    && match clause {
+                        MatchClause::Where(w) => w
+                            .evaluate(&mut QueryContext {
+                                cache,
+                                query_match: &query_match,
+                                captures: &captures,
+                            })
+                            .map_err(ScriptError::Query)?,
+                    };
+
+                Ok::<bool, ScriptError>(result)
+            })?;
+
+            if !clauses_matching {
+                continue;
+            }
+
+            matches.push(QueryMatch { captures });
+        }
+
+        matches
+    };
+
+    for query_match in &matches {
+        let mut match_ctx = MatchContext {
+            cache,
+            query_match,
+            tree_idx,
+        };
+
+        let new_result = match &mat.action {
+            MatchAction::Replace(replace) => replace.execute(&mut match_ctx)?,
+            MatchAction::Warn(warn) => warn.execute(&mut match_ctx)?,
+            MatchAction::Remove(remove) => remove.execute(&mut match_ctx)?,
+            MatchAction::Insert(insert) => insert.execute(&mut match_ctx)?,
+        };
+
+        result.combine(new_result);
+    }
+
+    Ok(())
+}
+
 impl Executable<ScriptContext> for Match {
     type Error = ScriptError;
 
@@ -179,92 +274,32 @@ impl Executable<ScriptContext> for Match {
 
         let ctx = Rc::new(ctx);
 
-        let mut trees = vec![&ctx.file_tree];
-        if ctx.parse_macros {
-            trees.extend(&ctx.macro_trees);
-        }
-
         let mut result = ExecutionResult::default();
+        execute_match(
+            self,
+            &ctx.file_cache,
+            0,
+            &ctx.file_tree,
+            query,
+            &mut cursor,
+            &mut result,
+        )?;
 
-        for tree in trees {
-            let matches = {
-                let clauses = &self.clauses;
-
-                let mut matches = Vec::default();
-
-                for query_match in cursor.matches(query, tree.root_node(), &ctx.cache) {
-                    let mut captures = HashMap::default();
-
-                    let predicates_matching = query
-                        .evaluate(&mut QueryContext {
-                            cache: &ctx.cache,
-                            query_match: &query_match,
-                            captures: &captures,
-                        })
-                        .map_err(ScriptError::Query)?;
-
-                    if !predicates_matching {
-                        continue;
-                    }
-
-                    captures.extend(
-                        query_match
-                            .captures
-                            .iter()
-                            .map(|c| (query.capture_names()[c.index as usize].clone(), c.node))
-                            .chain(once(("".to_string(), tree.root_node()))),
-                    );
-
-                    let clauses_matching = clauses.iter().try_fold(true, |result, clause| {
-                        let result = result
-                            && match clause {
-                                MatchClause::Where(w) => w
-                                    .evaluate(&mut QueryContext {
-                                        cache: &ctx.cache,
-                                        query_match: &query_match,
-                                        captures: &captures,
-                                    })
-                                    .map_err(ScriptError::Query)?,
-                            };
-
-                        Ok::<bool, ScriptError>(result)
-                    })?;
-
-                    if !clauses_matching {
-                        continue;
-                    }
-
-                    matches.push(QueryMatch { captures });
-                }
-
-                matches
-            };
-
-            for query_match in &matches {
-                let mut match_ctx = MatchContext {
-                    script_ctx: ctx.clone(),
-                    query_match,
-                };
-
-                let new_result = match &self.action {
-                    MatchAction::Replace(replace) => replace.execute(&mut match_ctx)?,
-                    MatchAction::Warn(warn) => warn.execute(&mut match_ctx)?,
-                    MatchAction::Remove(remove) => remove.execute(&mut match_ctx)?,
-                    MatchAction::Insert(insert) => insert.execute(&mut match_ctx)?,
-                };
-
-                result.combine(new_result);
-            }
+        for (tree_idx, (cache, tree)) in ctx.macros.iter().enumerate() {
+            execute_match(self, cache, tree_idx, tree, query, &mut cursor, &mut result)?;
         }
 
         Ok(result)
     }
 }
 
-impl<'a> Executable<MatchContext<'a>> for Replace {
+impl<'a, C> Executable<MatchContext<'a, C>> for Replace
+where
+    C: SourceCache,
+{
     type Error = ScriptError;
 
-    fn execute(&self, ctx: &mut MatchContext) -> Result<ExecutionResult, Self::Error> {
+    fn execute(&self, ctx: &mut MatchContext<C>) -> Result<ExecutionResult, Self::Error> {
         let node = ctx
             .query_match
             .captures
@@ -282,15 +317,12 @@ impl<'a> Executable<MatchContext<'a>> for Replace {
             let error_start_byte = error.start_byte();
             let error_end_byte = error.end_byte();
 
-            return Err(ScriptError::EditInErrorNode(EditInErrorNodeError {
-                src: ctx
-                    .script_ctx
-                    .named_source()
-                    .map_err(ScriptError::FromUtf8)?,
-                error_span: (error_start_byte, error_end_byte - error_start_byte).into(),
-                error_label: error.to_sexp(),
-                edit_span: (start_byte, old_end_byte - start_byte).into(),
-            }));
+            return Err(ScriptError::EditInErrorNode(EditInErrorNodeError::new(
+                error.to_sexp(),
+                (error_start_byte, error_end_byte - error_start_byte).into(),
+                (start_byte, old_end_byte - start_byte).into(),
+                ctx.cache,
+            )));
         }
 
         let new_text = self.replacement.evaluate(ctx)?;
@@ -315,6 +347,7 @@ impl<'a> Executable<MatchContext<'a>> for Replace {
                 },
             },
             new_text,
+            tree_idx: ctx.tree_idx,
         };
 
         Ok(ExecutionResult {
@@ -324,28 +357,27 @@ impl<'a> Executable<MatchContext<'a>> for Replace {
     }
 }
 
-impl<'a> Executable<MatchContext<'a>> for Warn {
+impl<'a, C> Executable<MatchContext<'a, C>> for Warn
+where
+    C: SourceCache,
+{
     type Error = ScriptError;
 
-    fn execute(&self, ctx: &mut MatchContext) -> Result<ExecutionResult, Self::Error> {
+    fn execute(&self, ctx: &mut MatchContext<C>) -> Result<ExecutionResult, Self::Error> {
         let msg = self.message.evaluate(ctx)?;
 
         let node = ctx.query_match.captures.get(&self.capture_name);
         let Some(node) = node else { return Ok(ExecutionResult::default()); };
 
-        let byte_range = ctx.script_ctx.cache.translate_range(node.byte_range());
-
-        let file = ctx.script_ctx.cache.file().to_owned();
-        let report: Report<FileSpan> =
-            Report::build(ReportKind::Warning, file.clone(), byte_range.start)
-                .with_config(ctx.script_ctx.report_config)
-                .with_label(
-                    Label::new((file, byte_range))
-                        .with_message(msg)
-                        .with_color(Color::Yellow),
-                )
-                .finish();
-
+        let report = miette::miette!(
+            severity = Severity::Warning,
+            labels = [LabeledSpan::new_with_span(
+                None,
+                ctx.cache.translate_span(node.byte_range().into()),
+            )],
+            "{}",
+            msg,
+        );
         Ok(ExecutionResult {
             edits: vec![],
             reports: vec![report],
@@ -353,10 +385,13 @@ impl<'a> Executable<MatchContext<'a>> for Warn {
     }
 }
 
-impl<'a> Executable<MatchContext<'a>> for Remove {
+impl<'a, C> Executable<MatchContext<'a, C>> for Remove
+where
+    C: SourceCache,
+{
     type Error = ScriptError;
 
-    fn execute(&self, ctx: &mut MatchContext) -> Result<ExecutionResult, Self::Error> {
+    fn execute(&self, ctx: &mut MatchContext<C>) -> Result<ExecutionResult, Self::Error> {
         let node = ctx
             .query_match
             .captures
@@ -375,15 +410,12 @@ impl<'a> Executable<MatchContext<'a>> for Remove {
             let error_start_byte = error.start_byte();
             let error_end_byte = error.end_byte();
 
-            return Err(ScriptError::EditInErrorNode(EditInErrorNodeError {
-                src: ctx
-                    .script_ctx
-                    .named_source()
-                    .map_err(ScriptError::FromUtf8)?,
-                error_span: (error_start_byte, error_end_byte - error_start_byte).into(),
-                error_label: error.to_sexp(),
-                edit_span: (start_byte, old_end_byte - start_byte).into(),
-            }));
+            return Err(ScriptError::EditInErrorNode(EditInErrorNodeError::new(
+                error.to_sexp(),
+                (error_start_byte, error_end_byte - error_start_byte).into(),
+                (start_byte, old_end_byte - start_byte).into(),
+                ctx.cache,
+            )));
         }
 
         let tree_edit = TreeEdit {
@@ -399,6 +431,7 @@ impl<'a> Executable<MatchContext<'a>> for Remove {
                 },
             },
             new_text: String::default(),
+            tree_idx: ctx.tree_idx,
         };
 
         Ok(ExecutionResult {
@@ -408,10 +441,13 @@ impl<'a> Executable<MatchContext<'a>> for Remove {
     }
 }
 
-impl<'a> Executable<MatchContext<'a>> for Insert {
+impl<'a, C> Executable<MatchContext<'a, C>> for Insert
+where
+    C: SourceCache,
+{
     type Error = ScriptError;
 
-    fn execute(&self, ctx: &mut MatchContext) -> Result<ExecutionResult, Self::Error> {
+    fn execute(&self, ctx: &mut MatchContext<C>) -> Result<ExecutionResult, Self::Error> {
         let node = ctx
             .query_match
             .captures
@@ -430,15 +466,12 @@ impl<'a> Executable<MatchContext<'a>> for Insert {
             let error_start_byte = error.start_byte();
             let error_end_byte = error.end_byte();
 
-            return Err(ScriptError::EditInErrorNode(EditInErrorNodeError {
-                src: ctx
-                    .script_ctx
-                    .named_source()
-                    .map_err(ScriptError::FromUtf8)?,
-                error_span: (error_start_byte, error_end_byte - error_start_byte).into(),
-                error_label: error.to_sexp(),
-                edit_span: (start_byte, old_end_byte - start_byte).into(),
-            }));
+            return Err(ScriptError::EditInErrorNode(EditInErrorNodeError::new(
+                error.to_sexp(),
+                (error_start_byte, error_end_byte - error_start_byte).into(),
+                (start_byte, old_end_byte - start_byte).into(),
+                ctx.cache,
+            )));
         }
 
         let new_text = self.insertion.evaluate(ctx)?;
@@ -464,6 +497,7 @@ impl<'a> Executable<MatchContext<'a>> for Insert {
                     },
                 },
                 new_text,
+                tree_idx: ctx.tree_idx,
             },
             InsertLocation::After => TreeEdit {
                 edit: InputEdit {
@@ -482,6 +516,7 @@ impl<'a> Executable<MatchContext<'a>> for Insert {
                     },
                 },
                 new_text,
+                tree_idx: ctx.tree_idx,
             },
         };
 
@@ -559,45 +594,46 @@ where
     Ok(value)
 }
 
-impl<'mat> Evaluatable<String, MatchContext<'mat>> for StringExpression {
+impl<'a, C> Evaluatable<String, MatchContext<'a, C>> for StringExpression
+where
+    C: SourceCache,
+{
     type Error = ScriptError;
 
-    fn evaluate(&self, ctx: &mut MatchContext) -> Result<String, Self::Error> {
+    fn evaluate(&self, ctx: &mut MatchContext<C>) -> Result<String, Self::Error> {
         evaluate_string_expression(self, |name| {
             ctx.query_match
                 .captures
                 .get(name)
                 .ok_or(ScriptError::CaptureNotFound(name.to_string()))
-                .and_then(|&node| {
-                    ctx.script_ctx
-                        .get_node_string(node)
-                        .map(ToString::to_string)
-                        .map_err(ScriptError::Utf8)
-                })
+                .map(|&node| ctx.cache.get_node_string(node))
         })
     }
 }
 
-impl<'a> Evaluatable<String, QueryContext<'a>> for StringExpression {
+impl<'a, C> Evaluatable<String, QueryContext<'a, C>> for StringExpression
+where
+    C: SourceCache,
+    for<'t> &'t C: TextProvider<'t>,
+{
     type Error = QueryError;
 
-    fn evaluate(&self, ctx: &mut QueryContext) -> Result<String, Self::Error> {
+    fn evaluate(&self, ctx: &mut QueryContext<C>) -> Result<String, Self::Error> {
         evaluate_string_expression(self, |name| {
             ctx.captures
                 .get(name)
                 .ok_or(QueryError::CaptureNotFound(name.to_string()))
-                .and_then(|&node| {
-                    ctx.cache
-                        .get_node_string(node)
-                        .map(ToString::to_string)
-                        .map_err(QueryError::Utf8)
-                })
+                .map(|&node| ctx.cache.get_node_string(node))
         })
     }
 }
 
-struct QueryContext<'a> {
-    cache: &'a FileCache,
+struct QueryContext<'a, C>
+where
+    C: SourceCache,
+    for<'t> &'t C: TextProvider<'t>,
+{
+    cache: &'a C,
     query_match: &'a tree_sitter::QueryMatch<'a, 'a>,
     captures: &'a HashMap<String, Node<'a>>,
 }
@@ -621,10 +657,14 @@ pub enum QueryError {
     Utf8(#[from] std::str::Utf8Error),
 }
 
-impl<'a> Evaluatable<bool, QueryContext<'a>> for tree_sitter::Query {
+impl<'a, C> Evaluatable<bool, QueryContext<'a, C>> for tree_sitter::Query
+where
+    C: SourceCache,
+    for<'t> &'t C: TextProvider<'t>,
+{
     type Error = QueryError;
 
-    fn evaluate(&self, ctx: &mut QueryContext) -> Result<bool, Self::Error> {
+    fn evaluate(&self, ctx: &mut QueryContext<C>) -> Result<bool, Self::Error> {
         self.general_predicates(ctx.query_match.pattern_index)
             .iter()
             .try_fold(true, |result, predicate| {
@@ -680,10 +720,9 @@ impl<'a> Evaluatable<bool, QueryContext<'a>> for tree_sitter::Query {
                             .single()
                             .expect("non-unique capture index");
 
-                        let node_text =
-                            ctx.cache.get_node_string(node).map_err(QueryError::Utf8)?;
+                        let node_text = ctx.cache.get_node_string(node);
 
-                        strings.contains(node_text)
+                        strings.contains(node_text.as_str())
                     }
                     s => {
                         return Err(QueryError::UnknownPredicate(s.to_string()));
@@ -695,10 +734,14 @@ impl<'a> Evaluatable<bool, QueryContext<'a>> for tree_sitter::Query {
     }
 }
 
-impl<'a> Evaluatable<bool, QueryContext<'a>> for WhereExpr {
+impl<'a, C> Evaluatable<bool, QueryContext<'a, C>> for WhereExpr
+where
+    C: SourceCache,
+    for<'t> &'t C: TextProvider<'t>,
+{
     type Error = QueryError;
 
-    fn evaluate(&self, ctx: &mut QueryContext) -> Result<bool, Self::Error> {
+    fn evaluate(&self, ctx: &mut QueryContext<C>) -> Result<bool, Self::Error> {
         match self {
             WhereExpr::Equals(EqualsExpr { left, right }) => {
                 let left = left.evaluate(ctx)?;

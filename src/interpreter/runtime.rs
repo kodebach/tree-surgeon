@@ -1,31 +1,34 @@
 use std::{
-    io::{Read, Write},
+    fs::File,
+    io::{BufReader, Read},
     path::PathBuf,
 };
 
-use ariadne::{Color, Label, Report, ReportKind, Source};
+use miette::{miette, LabeledSpan, Severity};
+use ropey::Rope;
 use tree_sitter::{Parser, QueryCursor, Tree};
 
 use crate::{dsl::ast::Script, parser::Parsable, single::Single};
 
 use super::{
-    cache::{FileCache, FileSpan, MacroCache, SourceCache},
+    cache::{FileCache, MacroCache, SourceCache},
     execution::{Executable, ExecutionResult, ScriptContext, ScriptError},
     tree_cursor::TreeCusorExt,
 };
 
-fn parse_source<'a>(
+fn parse_source<C>(
     parser: &mut Parser,
-    cache: &impl SourceCache,
+    cache: &C,
     log_level: LogLevel,
     old_tree: Option<&Tree>,
-    config: ariadne::Config,
-) -> (Option<Tree>, Vec<Report<'a, FileSpan>>) {
-    let file = cache.file().to_path_buf();
-    let tree = parser.parse(cache.bytes().get(), old_tree);
+) -> Option<Tree>
+where
+    C: SourceCache,
+{
+    let tree = cache.parse(parser, old_tree);
 
     if let Some(tree) = tree {
-        let mut errors: Vec<_> = if log_level <= LogLevel::Advice {
+        let mut reports: Vec<_> = if log_level <= LogLevel::Advice {
             let cursor = tree.walk();
             let error_iter = cursor.error_iter();
 
@@ -33,60 +36,60 @@ fn parse_source<'a>(
                 .map(|node| {
                     let parent = node.parent().unwrap_or(node);
 
-                    let node_range = cache.translate_range(node.byte_range());
-                    let parent_range = cache.translate_range(parent.byte_range());
+                    let node_span = cache.translate_span(node.byte_range().into());
+                    let parent_span = cache.translate_span(parent.byte_range().into());
 
-                    Report::build(ReportKind::Advice, file.clone(), node_range.start)
-                        .with_config(config)
-                        .with_message("tree-sitter couldn't parse code fragment")
-                        .with_label(
-                            Label::new((file.clone(), parent_range)).with_message(parent.to_sexp()),
-                        )
-                        .with_label(
-                            Label::new((file.clone(), node_range))
-                                .with_message(node.to_sexp())
-                                .with_color(Color::Red),
-                        )
-                        .finish()
+                    miette!(
+                        severity = Severity::Advice,
+                        labels = [
+                            LabeledSpan::new_with_span(Some(parent.to_sexp()), parent_span),
+                            LabeledSpan::new_with_span(Some(node.to_sexp()), node_span),
+                        ],
+                        "tree-sitter couldn't parse code fragment"
+                    )
                 })
                 .collect()
         } else {
             Vec::new()
         };
 
-        if log_level <= LogLevel::Warning && !errors.is_empty() {
-            errors.insert(
+        if log_level <= LogLevel::Warning && !reports.is_empty() {
+            reports.insert(
                 0,
-                Report::build(ReportKind::Warning, file.clone(), 0)
-                    .with_config(config)
-                    .with_message(format!(
-                        "tree-sitter returned {} parse errors",
-                        errors.len()
-                    ))
-                    .finish(),
+                miette!(
+                    severity = Severity::Error,
+                    "tree-sitter returned {} parse errors",
+                    reports.len()
+                ),
             )
         }
 
-        (Some(tree), errors)
-    } else if log_level <= LogLevel::Error {
-        let error = Report::build(ReportKind::Error, file, 0)
-            .with_config(config)
-            .with_message("tree-sitter couldn't parse source file")
-            .finish();
+        for report in reports {
+            eprintln!("{:?}", report.with_source_code(cache.to_string()));
+        }
 
-        (None, vec![error])
+        Some(tree)
+    } else if log_level <= LogLevel::Error {
+        let report = miette!(
+            severity = Severity::Error,
+            "tree-sitter couldn't parse source file"
+        )
+        .with_source_code(cache.to_string());
+
+        eprintln!("{:?}", report);
+
+        None
     } else {
-        (None, Vec::default())
+        None
     }
 }
 
-fn parse_macros<'a>(
+fn parse_macros(
     file_tree: &Tree,
     cache: &FileCache,
     parser: &mut Parser,
     log_level: LogLevel,
-    config: ariadne::Config,
-) -> (Vec<Tree>, Vec<Report<'a, FileSpan>>) {
+) -> Vec<(MacroCache, Tree)> {
     let macro_query = tree_sitter::Query::new(tree_sitter_c::language(), "((preproc_arg) @macro)")
         .expect("macro_query broken");
 
@@ -97,29 +100,24 @@ fn parse_macros<'a>(
     let mut cursor = QueryCursor::new();
     let macros = cursor.matches(&macro_query, file_tree.root_node(), cache);
 
-    let mut trees = vec![];
-    let mut reports = vec![];
+    let mut results = vec![];
 
     for query_match in macros {
         let node = query_match
             .nodes_for_capture_index(capture_idx)
             .single()
             .expect("macro_query broken (get)");
-        let macro_cache = MacroCache {
-            file_cache: cache.clone(),
-            span: node.byte_range(),
-        };
 
-        let (tree, mut new_reports) = parse_source(parser, &macro_cache, log_level, None, config);
+        let macro_cache = MacroCache::new(cache, node.byte_range());
 
-        reports.append(&mut new_reports);
+        let tree = parse_source(parser, &macro_cache, log_level, None);
 
         if let Some(tree) = tree {
-            trees.push(tree);
+            results.push((macro_cache, tree));
         }
     }
 
-    (trees, reports)
+    results
 }
 
 pub struct Interpreter {
@@ -129,7 +127,6 @@ pub struct Interpreter {
 }
 
 pub struct InterpreterConfig {
-    pub report_config: ariadne::Config,
     pub log_level: LogLevel,
     pub in_place: bool,
     pub parse_macros: bool,
@@ -170,7 +167,7 @@ impl Interpreter {
     pub fn new(
         script_file: Option<PathBuf>,
         config: InterpreterConfig,
-    ) -> Result<Interpreter, InterpreterError> {
+    ) -> Result<Self, InterpreterError> {
         let mut parser = Parser::new();
         parser
             .set_language(tree_sitter_c::language())
@@ -191,23 +188,17 @@ impl Interpreter {
             source
         };
 
-        let (script, reports) = Script::parse(
-            &script_source,
-            tree_sitter_c::language(),
-            config.report_config,
-        );
+        let (script, reports) = Script::parse(&script_source, tree_sitter_c::language());
 
         for report in reports {
-            report
-                .eprint(Source::from(&script_source))
-                .map_err(InterpreterError::Io)?;
+            eprintln!("{:?}", report.with_source_code(script_source.clone()));
         }
 
         let script = script.ok_or(InterpreterError::ScriptParse {
             script_file: script_file.unwrap_or(PathBuf::from("<stdin>")),
         })?;
 
-        Ok(Interpreter {
+        Ok(Self {
             parser,
             config,
             script,
@@ -215,95 +206,79 @@ impl Interpreter {
     }
 
     pub fn run(&mut self, source_file: PathBuf) -> Result<(), InterpreterError> {
-        let source = std::fs::read(&source_file).map_err(InterpreterError::Io)?;
-
+        let source = Rope::from_reader(BufReader::new(
+            File::open(&source_file).map_err(InterpreterError::Io)?,
+        ))
+        .map_err(InterpreterError::Io)?;
         let cache = FileCache::new(source, source_file);
 
-        let (file_tree, reports) = parse_source(
-            &mut self.parser,
-            &cache,
-            self.config.log_level,
-            None,
-            self.config.report_config,
-        );
-
-        for report in reports {
-            report
-                .eprint(cache.clone())
-                .map_err(InterpreterError::Io)?;
-        }
+        let file_tree = parse_source(&mut self.parser, &cache, self.config.log_level, None);
 
         let file_tree = file_tree.ok_or(InterpreterError::TreeParse {
             source_file: cache.file().to_owned(),
         })?;
 
-        let mut reports = Vec::default();
-
         let mut script_ctx = ScriptContext {
-            cache,
+            file_cache: cache,
             file_tree,
-            macro_trees: vec![],
-            parse_macros: self.config.parse_macros,
-            report_config: self.config.report_config,
+            macros: vec![],
         };
 
         loop {
-            let (macro_trees, mut new_reports) = parse_macros(
+            let macros = parse_macros(
                 &script_ctx.file_tree,
-                &script_ctx.cache,
+                &script_ctx.file_cache,
                 &mut self.parser,
                 self.config.log_level,
-                self.config.report_config,
             );
-            reports.append(&mut new_reports);
-            script_ctx.macro_trees = macro_trees;
+            script_ctx.macros = macros;
 
-            let ExecutionResult {
-                edits,
-                reports: mut new_reports,
-            } = self
+            let ExecutionResult { edits, reports } = self
                 .script
                 .execute(&mut script_ctx)
                 .map_err(InterpreterError::Execution)?;
-            reports.append(&mut new_reports);
+
+            for report in reports {
+                eprintln!(
+                    "{:?}",
+                    report.with_source_code(script_ctx.file_cache.to_string())
+                );
+            }
 
             if edits.is_empty() {
                 break;
             }
 
             for edit in edits {
-                edit.apply(&mut script_ctx.cache, &mut script_ctx.file_tree);
+                edit.apply(&mut script_ctx);
 
-                let (new_tree, mut new_reports) = parse_source(
+                let new_tree = parse_source(
                     &mut self.parser,
-                    &script_ctx.cache,
+                    &script_ctx.file_cache,
                     self.config.log_level,
                     Some(&script_ctx.file_tree),
-                    self.config.report_config,
                 );
 
-                reports.append(&mut new_reports);
-
                 script_ctx.file_tree = new_tree.ok_or(InterpreterError::TreeParse {
-                    source_file: script_ctx.cache.file().to_owned(),
+                    source_file: script_ctx.file_cache.file().to_owned(),
                 })?;
             }
         }
 
         if self.config.in_place {
-            std::fs::write(script_ctx.cache.file(), script_ctx.cache.bytes())
+            let mut file =
+                File::create(script_ctx.file_cache.file()).map_err(InterpreterError::Io)?;
+            script_ctx
+                .file_cache
+                .write_to(&mut file)
                 .map_err(InterpreterError::Io)?;
         } else {
-            std::io::stdout()
-                .write(script_ctx.cache.bytes().get())
+            let mut stdout = std::io::stdout();
+            script_ctx
+                .file_cache
+                .write_to(&mut stdout)
                 .map_err(InterpreterError::Io)?;
-        }
-
-        for report in reports {
-            report
-                .eprint(script_ctx.cache.clone())
-                .map_err(InterpreterError::Io)?;
-        }
+        };
 
         Ok(())
     }

@@ -15,7 +15,6 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.57"
-ariadne = "0.2.0"
 chumsky = { version = "1.0.0-alpha.3", features = ["label"] }
 clap = { version = "3.2.2", features = ["derive"] }
 convert_case = "0.6.0"
@@ -23,7 +22,8 @@ derive_more = "0.99.17"
 is-terminal = "0.4.4"
 lazycell = "1.3.0"
 logos = "0.12.1"
-miette = { version = "5.5.0", features = ["fancy"] }
+miette = { version = "5.9.0", features = ["fancy"] }
+ropey = "1.6.0"
 strum = { version = "0.24.1", features = ["derive"] }
 thiserror = "1.0.31"
 tree-sitter = "0.20.6"

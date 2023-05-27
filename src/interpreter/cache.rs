@@ -1,169 +1,207 @@
 use std::{
-    borrow::BorrowMut,
+    fmt::Debug,
     ops::Range,
     path::{Path, PathBuf},
 };
 
-use ariadne::{Cache, Source};
+use miette::SourceSpan;
+use ropey::{Rope, RopeSlice};
+use tree_sitter::Node;
 
-use lazycell::LazyCell;
-use tree_sitter::{Node, TextProvider};
-
-pub type FileSpan = (PathBuf, Range<usize>);
-
-pub struct SourceSliceRef<'a> {
-    data: &'a [u8],
-}
-
-impl<'a> SourceSliceRef<'a> {
-    pub fn get(&'a self) -> &'a [u8] {
-        self.data
-    }
-}
-
-impl<'a> AsRef<[u8]> for SourceSliceRef<'a> {
-    fn as_ref(&self) -> &[u8] {
-        self.get()
-    }
-}
-
-pub trait SourceCache: Cache<PathBuf> {
-    fn bytes(&self) -> SourceSliceRef;
+pub trait SourceCache: Debug + ToString {
     fn file(&self) -> &Path;
 
-    fn translate_range(&self, range: Range<usize>) -> Range<usize>;
+    fn translate_span(&self, span: SourceSpan) -> SourceSpan;
 
-    fn update<F>(&mut self, update_fn: F)
-    where
-        F: FnOnce(&mut Vec<u8>);
+    fn get_node_string(&self, node: Node) -> String;
+
+    fn parse(
+        &self,
+        parser: &mut tree_sitter::Parser,
+        old_tree: Option<&tree_sitter::Tree>,
+    ) -> Option<tree_sitter::Tree>;
+
+    fn write_to(&self, target: &mut impl std::io::Write) -> std::io::Result<()>;
 }
 
-#[derive(Clone)]
+#[derive(Debug)]
 pub struct FileCache {
-    bytes: Vec<u8>, // ropey::Rope
-    source: LazyCell<Source>,
+    rope: Rope,
     file: PathBuf,
 }
 
 impl FileCache {
-    pub fn new(bytes: Vec<u8>, file: PathBuf) -> FileCache {
-        FileCache {
-            bytes,
-            source: LazyCell::new(),
-            file,
-        }
+    pub fn new(rope: Rope, file: PathBuf) -> FileCache {
+        FileCache { rope, file }
     }
 
     pub fn file(&self) -> &Path {
         self.file.as_path()
     }
 
-    pub fn get_node_text(&self, node: Node) -> &[u8] {
-        &self.bytes[node.byte_range()]
+    pub fn get_node_string(&self, node: Node) -> String {
+        return self.rope.byte_slice(node.byte_range()).to_string();
     }
 
-    pub fn get_node_string(&self, node: Node) -> Result<&str, std::str::Utf8Error> {
-        std::str::from_utf8(self.get_node_text(node))
+    pub fn apply_edit(&mut self, byte_range: Range<usize>, new_text: &str) {
+        let start_char = self.rope.byte_to_char(byte_range.start);
+        let old_end_char = self.rope.byte_to_char(byte_range.end);
+        self.rope.remove(start_char..old_end_char);
+        self.rope.insert(start_char, new_text);
     }
 }
 
-impl<'a> TextProvider<'a> for &'a FileCache {
-    type I = std::iter::Once<&'a [u8]>;
+trait TextProvider<'a>: tree_sitter::TextProvider<'a> {}
+
+impl<'a, C> TextProvider<'a> for &'a C
+where
+    C: SourceCache,
+    &'a C: TextProvider<'a>,
+{
+}
+
+impl<'a> tree_sitter::TextProvider<'a> for &'a FileCache {
+    type I = Chunks<'a>;
 
     fn text(&mut self, node: Node) -> Self::I {
-        std::iter::once(self.get_node_text(node))
+        let chunks = self.rope.byte_slice(node.byte_range()).chunks();
+        Chunks { chunks }
     }
+}
+
+impl<'a> Iterator for Chunks<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.chunks.next().map(str::as_bytes)
+    }
+}
+
+pub struct Chunks<'a> {
+    chunks: ropey::iter::Chunks<'a>,
 }
 
 impl SourceCache for FileCache {
-    fn bytes(&self) -> SourceSliceRef {
-        SourceSliceRef {
-            data: &self.bytes[0..self.bytes.len()],
-        }
-    }
-
     fn file(&self) -> &Path {
         &self.file
     }
 
-    fn translate_range(&self, range: Range<usize>) -> Range<usize> {
-        range
+    fn translate_span(&self, span: SourceSpan) -> SourceSpan {
+        span
     }
 
-    fn update<F>(&mut self, update_fn: F)
-    where
-        F: FnOnce(&mut Vec<u8>),
-    {
-        update_fn(self.bytes.borrow_mut());
-    }
-}
-
-impl Cache<PathBuf> for FileCache {
-    fn fetch(&mut self, id: &PathBuf) -> Result<&Source, Box<dyn std::fmt::Debug + '_>> {
-        if id == &self.file {
-            if !self.source.filled() {
-                self.source
-                    .fill(Source::from(String::from_utf8_lossy(self.bytes.as_slice())))
-                    .unwrap();
-            }
-
-            Ok(self.source.borrow().unwrap())
-        } else {
-            Err(Box::new(format!(
-                "Failed to fetch source '{}'",
-                id.display()
-            )))
-        }
+    fn get_node_string(&self, node: Node) -> String {
+        self.rope.byte_slice(node.byte_range()).to_string()
     }
 
-    fn display<'a>(&self, id: &'a PathBuf) -> Option<Box<dyn std::fmt::Display + 'a>> {
-        Some(Box::new(id.display()))
+    fn parse(
+        &self,
+        parser: &mut tree_sitter::Parser,
+        old_tree: Option<&tree_sitter::Tree>,
+    ) -> Option<tree_sitter::Tree> {
+        let mut callback = |offset, _| {
+            let (chunk, chunk_byte_index, _, _) = self.rope.chunk_at_byte(offset);
+            &chunk[(offset - chunk_byte_index)..]
+        };
+        parser.parse_with(&mut callback, old_tree)
+    }
+
+    fn write_to(&self, target: &mut impl std::io::Write) -> std::io::Result<()> {
+        self.rope.write_to(target)
     }
 }
 
-#[derive(Clone)]
+impl ToString for FileCache {
+    fn to_string(&self) -> String {
+        self.rope.to_string()
+    }
+}
+
+#[derive(Debug)]
 pub struct MacroCache {
-    pub file_cache: FileCache,
-    pub span: Range<usize>,
+    file: PathBuf,
+    rope: Rope,
+    range: Range<usize>,
 }
 
-impl SourceCache for MacroCache {
-    fn bytes(&self) -> SourceSliceRef {
-        SourceSliceRef {
-            data: &self.file_cache.bytes[self.span.clone()],
+impl MacroCache {
+    pub fn new(file_cache: &FileCache, range: Range<usize>) -> Self {
+        let rope = file_cache.rope.clone();
+        let start_line = rope.byte_to_line(range.start);
+        let end_line = rope.byte_to_line(range.end);
+
+        let start_col = rope.byte_to_char(range.start) - rope.line_to_char(start_line);
+        let end_col = rope.byte_to_char(range.end) - rope.line_to_char(end_line);
+
+        MacroCache {
+            file: PathBuf::from(format!(
+                "{}@{}:{}-{}:{}",
+                file_cache.file.to_string_lossy(),
+                start_line,
+                start_col,
+                end_line,
+                end_col
+            )),
+            rope,
+            range,
         }
     }
 
-    fn file(&self) -> &Path {
-        self.file_cache.file()
-    }
-
-    fn translate_range(&self, range: Range<usize>) -> Range<usize> {
-        let offset = self.span.start;
+    pub fn translate_range(&self, range: Range<usize>) -> Range<usize> {
+        let offset = self.range.start;
         range.start + offset..range.end + offset
     }
 
-    fn update<F>(&mut self, update_fn: F)
-    where
-        F: FnOnce(&mut Vec<u8>),
-    {
-        let mut macro_bytes = self.bytes().get().to_vec();
-        update_fn(&mut macro_bytes);
-        let new_span = self.span.start..self.span.start + macro_bytes.len();
-
-        self.file_cache.borrow_mut().update(|bytes| {
-            bytes.splice(self.span.clone(), macro_bytes);
-        });
-        self.span = new_span;
+    fn rope_slice(&self) -> RopeSlice {
+        self.rope.byte_slice(self.range.clone())
     }
 }
 
-impl Cache<PathBuf> for MacroCache {
-    fn fetch(&mut self, id: &PathBuf) -> Result<&Source, Box<dyn std::fmt::Debug + '_>> {
-        self.file_cache.borrow_mut().fetch(id)
+impl SourceCache for MacroCache {
+    fn file(&self) -> &Path {
+        &self.file
     }
 
-    fn display<'a>(&self, id: &'a PathBuf) -> Option<Box<dyn std::fmt::Display + 'a>> {
-        Some(Box::new(id.display()))
+    fn translate_span(&self, span: SourceSpan) -> SourceSpan {
+        SourceSpan::new((span.offset() + self.range.start).into(), span.len().into())
+    }
+
+    fn get_node_string(&self, node: Node) -> String {
+        self.rope_slice().byte_slice(node.byte_range()).to_string()
+    }
+
+    fn parse(
+        &self,
+        parser: &mut tree_sitter::Parser,
+        old_tree: Option<&tree_sitter::Tree>,
+    ) -> Option<tree_sitter::Tree> {
+        let mut callback = |offset, _| {
+            let (chunk, chunk_byte_index, _, _) = self.rope_slice().chunk_at_byte(offset);
+            &chunk[(offset - chunk_byte_index)..]
+        };
+        parser.parse_with(&mut callback, old_tree)
+    }
+
+    fn write_to(&self, target: &mut impl std::io::Write) -> std::io::Result<()> {
+        for chunk in self.rope_slice().chunks() {
+            target.write_all(chunk.as_bytes())?;
+        }
+
+        Ok(())
+    }
+}
+
+impl ToString for MacroCache {
+    fn to_string(&self) -> String {
+        self.rope_slice().to_string()
+    }
+}
+
+impl<'a> tree_sitter::TextProvider<'a> for &'a MacroCache {
+    type I = Chunks<'a>;
+
+    fn text(&mut self, node: Node) -> Self::I {
+        let chunks = self.rope_slice().byte_slice(node.byte_range()).chunks();
+        Chunks { chunks }
     }
 }

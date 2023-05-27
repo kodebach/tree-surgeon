@@ -1,9 +1,9 @@
-use ariadne::{Color, Label, Report, ReportKind};
 use chumsky::{
     input::{SliceInput, ValueInput},
     prelude::*,
 };
 use logos::Logos;
+use miette::{LabeledSpan, Severity, Report};
 use std::{fmt::Write, marker::PhantomData};
 use tree_sitter::{Language, Query as TsQuery};
 
@@ -14,11 +14,7 @@ use crate::dsl::ast::*;
 trait TokenInput<'a>: ValueInput<'a, Token = Token<'a>, Span = SimpleSpan> {}
 
 pub trait Parsable: Sized {
-    fn parse<'b>(
-        source: &str,
-        language: Language,
-        config: ariadne::Config,
-    ) -> (Option<Script>, Vec<Report<'b>>);
+    fn parse(source: &str, language: Language) -> (Option<Script>, Vec<Report>);
 }
 
 struct DslParser<'a, I> {
@@ -477,11 +473,7 @@ where
 }
 
 impl Parsable for Script {
-    fn parse<'b>(
-        source: &str,
-        language: Language,
-        config: ariadne::Config,
-    ) -> (Option<Script>, Vec<Report<'b>>) {
+    fn parse(source: &str, language: Language) -> (Option<Script>, Vec<Report>) {
         let parser = DslParser {
             source,
             language,
@@ -517,15 +509,19 @@ impl Parsable for Script {
                 })
             })
             .map(|e| {
-                Report::build(ReportKind::Error, (), e.span().start)
-                    .with_config(config)
-                    .with_message(e.to_string())
-                    .with_label(
-                        Label::new(e.span().into_range())
-                            .with_message(e.reason().to_string())
-                            .with_color(Color::Red),
-                    )
-                    .finish()
+                let span = e.span();
+
+                miette::miette!(
+                    severity = Severity::Error,
+                    code = "tree_surgeon::dsl::parse",
+                    labels = [LabeledSpan::new(
+                        Some(e.reason().to_string()),
+                        span.start,
+                        span.end - span.start
+                    )],
+                    "{}",
+                    e,
+                )
             })
             .collect();
 
