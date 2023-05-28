@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::{ArgAction, Parser, command};
+use clap::{command, ArgAction, Parser};
 
 use tree_surgeon::interpreter::{self, Interpreter, InterpreterConfig};
 
@@ -66,8 +66,10 @@ impl Language {
 fn main() -> miette::Result<()> {
     let cli = Cli::parse();
 
+    let mut stderr = std::io::stderr();
     let mut interpreter = Interpreter::new(
         cli.script_file,
+        &mut stderr,
         InterpreterConfig {
             log_level: cli.log_level.interpreter_level(),
             language: cli.language.tree_sitter_language(),

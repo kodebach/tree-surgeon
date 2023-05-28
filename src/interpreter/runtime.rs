@@ -1,6 +1,6 @@
 use std::{
     fs::File,
-    io::{BufReader, Read},
+    io::{self, BufReader, Read},
     path::PathBuf,
 };
 
@@ -17,14 +17,16 @@ use super::{
     tree_cursor::TreeCusorExt,
 };
 
-fn parse_source<C>(
+fn parse_source<C, E>(
     parser: &mut Parser,
     cache: &C,
     log_level: LogLevel,
     old_tree: Option<&Tree>,
+    output: &mut E,
 ) -> Option<Tree>
 where
     C: SourceCache,
+    E: io::Write,
 {
     let tree = cache.parse(parser, old_tree);
 
@@ -66,7 +68,12 @@ where
         }
 
         for report in reports {
-            eprintln!("{:?}", report.with_source_code(cache.to_string()));
+            output
+                .write_fmt(format_args!(
+                    "{:?}",
+                    report.with_source_code(cache.to_string())
+                ))
+                .unwrap();
         }
 
         Some(tree)
@@ -77,7 +84,7 @@ where
         )
         .with_source_code(cache.to_string());
 
-        eprintln!("{:?}", report);
+        output.write_fmt(format_args!("{:?}", report)).unwrap();
 
         None
     } else {
@@ -85,13 +92,17 @@ where
     }
 }
 
-fn parse_macros(
+fn parse_macros<E>(
     file_tree: &Tree,
     cache: &FileCache,
     parser: &mut Parser,
     log_level: LogLevel,
     language: tree_sitter::Language,
-) -> Vec<(MacroCache, Tree)> {
+    output: &mut E,
+) -> Vec<(MacroCache, Tree)>
+where
+    E: io::Write,
+{
     let macro_query =
         tree_sitter::Query::new(language, "((preproc_arg) @macro)").expect("macro_query broken");
 
@@ -112,7 +123,7 @@ fn parse_macros(
 
         let macro_cache = MacroCache::new(cache, node.byte_range());
 
-        let tree = parse_source(parser, &macro_cache, log_level, None);
+        let tree = parse_source(parser, &macro_cache, log_level, None, output);
 
         if let Some(tree) = tree {
             results.push((macro_cache, tree));
@@ -122,9 +133,10 @@ fn parse_macros(
     results
 }
 
-pub struct Interpreter {
+pub struct Interpreter<'a, E: io::Write> {
     parser: Parser,
     script: Script,
+    output: &'a mut E,
     config: InterpreterConfig,
 }
 
@@ -166,16 +178,22 @@ pub enum InterpreterError {
     Utf8(#[from] std::string::FromUtf8Error),
 }
 
-impl Interpreter {
+impl<'a, E: io::Write> Interpreter<'a, E> {
     fn from_script(
         script_source: String,
         script_file: Option<PathBuf>,
+        output: &'a mut E,
         config: InterpreterConfig,
     ) -> Result<Self, InterpreterError> {
         let (script, reports) = Script::parse(&script_source, config.language);
 
         for report in reports {
-            eprintln!("{:?}", report.with_source_code(script_source.clone()));
+            output
+                .write_fmt(format_args!(
+                    "{:?}",
+                    report.with_source_code(script_source.clone())
+                ))
+                .unwrap();
         }
 
         let script = script.ok_or(InterpreterError::ScriptParse {
@@ -191,11 +209,13 @@ impl Interpreter {
             parser,
             config,
             script,
+            output,
         })
     }
 
     pub fn new(
         script_file: Option<PathBuf>,
+        output: &'a mut E,
         config: InterpreterConfig,
     ) -> Result<Self, InterpreterError> {
         let script_source = if let Some(ref script_file) = script_file {
@@ -213,11 +233,17 @@ impl Interpreter {
             source
         };
 
-        Self::from_script(script_source, script_file, config)
+        Self::from_script(script_source, script_file, output, config)
     }
 
     fn run_impl(&mut self, cache: FileCache) -> Result<ScriptContext, InterpreterError> {
-        let file_tree = parse_source(&mut self.parser, &cache, self.config.log_level, None);
+        let file_tree = parse_source(
+            &mut self.parser,
+            &cache,
+            self.config.log_level,
+            None,
+            &mut self.output,
+        );
 
         let file_tree = file_tree.ok_or(InterpreterError::TreeParse {
             source_file: cache.file().to_owned(),
@@ -236,6 +262,7 @@ impl Interpreter {
                 &mut self.parser,
                 self.config.log_level,
                 self.config.language,
+                &mut self.output,
             );
             script_ctx.macros = macros;
 
@@ -245,10 +272,12 @@ impl Interpreter {
                 .map_err(InterpreterError::Execution)?;
 
             for report in reports {
-                eprintln!(
-                    "{:?}",
-                    report.with_source_code(script_ctx.file_cache.to_string())
-                );
+                self.output
+                    .write_fmt(format_args!(
+                        "{:?}",
+                        report.with_source_code(script_ctx.file_cache.to_string())
+                    ))
+                    .unwrap();
             }
 
             if edits.is_empty() {
@@ -263,6 +292,7 @@ impl Interpreter {
                     &script_ctx.file_cache,
                     self.config.log_level,
                     Some(&script_ctx.file_tree),
+                    &mut self.output,
                 );
 
                 script_ctx.file_tree = new_tree.ok_or(InterpreterError::TreeParse {
@@ -346,11 +376,16 @@ impl Interpreter {
     "##
 )]
 fn test_interpreter(#[case] test_name: &str, #[case] script: &str, #[case] source: &str) {
+    let _ = miette::set_hook(Box::new(|_| Box::<miette::JSONReportHandler>::default()));
+
     let source = Rope::from_str(source);
+
+    let mut output = Vec::default();
 
     let mut interpreter = Interpreter::from_script(
         script.to_string(),
         Some(PathBuf::new()),
+        &mut output,
         InterpreterConfig {
             language: tree_sitter_c::language(),
             log_level: LogLevel::None,
@@ -361,6 +396,10 @@ fn test_interpreter(#[case] test_name: &str, #[case] script: &str, #[case] sourc
     .unwrap();
 
     let result = interpreter.run_impl(FileCache::new(source, PathBuf::new()));
+
+    insta::with_settings!({ snapshot_suffix => format!("{}-output", test_name) }, {
+        insta::assert_snapshot!(String::from_utf8(output).unwrap());
+    });
 
     match result {
         Ok(ctx) => {
