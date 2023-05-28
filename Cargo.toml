@@ -26,6 +26,7 @@ miette = { version = "5.9.0", features = ["fancy"] }
 proptest = "1.2.0"
 ropey = "1.6.0"
 rstest = "0.17.0"
+similar-asserts = "1.4.2"
 strum = { version = "0.24.1", features = ["derive"] }
 thiserror = "1.0.40"
 tree-sitter = "0.20.10"
