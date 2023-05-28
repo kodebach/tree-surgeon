@@ -89,8 +89,9 @@ fn parse_macros(
     cache: &FileCache,
     parser: &mut Parser,
     log_level: LogLevel,
+    language: tree_sitter::Language,
 ) -> Vec<(MacroCache, Tree)> {
-    let macro_query = tree_sitter::Query::new(tree_sitter_c::language(), "((preproc_arg) @macro)")
+    let macro_query = tree_sitter::Query::new(language, "((preproc_arg) @macro)")
         .expect("macro_query broken");
 
     let capture_idx = macro_query
@@ -127,6 +128,7 @@ pub struct Interpreter {
 }
 
 pub struct InterpreterConfig {
+    pub language: tree_sitter::Language,
     pub log_level: LogLevel,
     pub in_place: bool,
     pub parse_macros: bool,
@@ -170,7 +172,7 @@ impl Interpreter {
     ) -> Result<Self, InterpreterError> {
         let mut parser = Parser::new();
         parser
-            .set_language(tree_sitter_c::language())
+            .set_language(config.language)
             .expect("parser construction failed");
 
         let script_source = if let Some(ref script_file) = script_file {
@@ -188,7 +190,7 @@ impl Interpreter {
             source
         };
 
-        let (script, reports) = Script::parse(&script_source, tree_sitter_c::language());
+        let (script, reports) = Script::parse(&script_source, config.language);
 
         for report in reports {
             eprintln!("{:?}", report.with_source_code(script_source.clone()));
@@ -230,6 +232,7 @@ impl Interpreter {
                 &script_ctx.file_cache,
                 &mut self.parser,
                 self.config.log_level,
+                self.config.language,
             );
             script_ctx.macros = macros;
 
