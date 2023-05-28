@@ -1,0 +1,5 @@
+---
+source: src/interpreter/runtime.rs
+expression: ctx.file_tree.root_node().to_sexp()
+---
+(translation_unit (preproc_include path: (system_lib_string)) (preproc_include path: (system_lib_string)) (preproc_include path: (system_lib_string)) (function_definition type: (primitive_type) declarator: (function_declarator declarator: (identifier) parameters: (parameter_list (parameter_declaration type: (primitive_type)))) body: (compound_statement (expression_statement (call_expression function: (identifier) arguments: (argument_list (identifier)))))))

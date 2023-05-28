@@ -6,6 +6,7 @@ use std::{
 
 use miette::{miette, LabeledSpan, Severity};
 use ropey::Rope;
+use rstest::rstest;
 use tree_sitter::{Parser, QueryCursor, Tree};
 
 use crate::{dsl::ast::Script, parser::Parsable, single::Single};
@@ -91,8 +92,8 @@ fn parse_macros(
     log_level: LogLevel,
     language: tree_sitter::Language,
 ) -> Vec<(MacroCache, Tree)> {
-    let macro_query = tree_sitter::Query::new(language, "((preproc_arg) @macro)")
-        .expect("macro_query broken");
+    let macro_query =
+        tree_sitter::Query::new(language, "((preproc_arg) @macro)").expect("macro_query broken");
 
     let capture_idx = macro_query
         .capture_index_for_name("macro")
@@ -166,15 +167,37 @@ pub enum InterpreterError {
 }
 
 impl Interpreter {
-    pub fn new(
+    fn from_script(
+        script_source: String,
         script_file: Option<PathBuf>,
         config: InterpreterConfig,
     ) -> Result<Self, InterpreterError> {
+        let (script, reports) = Script::parse(&script_source, config.language);
+
+        for report in reports {
+            eprintln!("{:?}", report.with_source_code(script_source.clone()));
+        }
+
+        let script = script.ok_or(InterpreterError::ScriptParse {
+            script_file: script_file.unwrap_or(PathBuf::from("<stdin>")),
+        })?;
+
         let mut parser = Parser::new();
         parser
             .set_language(config.language)
             .expect("parser construction failed");
 
+        Ok(Self {
+            parser,
+            config,
+            script,
+        })
+    }
+
+    pub fn new(
+        script_file: Option<PathBuf>,
+        config: InterpreterConfig,
+    ) -> Result<Self, InterpreterError> {
         let script_source = if let Some(ref script_file) = script_file {
             let script_buf = std::fs::read(script_file).map_err(InterpreterError::Io)?;
 
@@ -190,30 +213,10 @@ impl Interpreter {
             source
         };
 
-        let (script, reports) = Script::parse(&script_source, config.language);
-
-        for report in reports {
-            eprintln!("{:?}", report.with_source_code(script_source.clone()));
-        }
-
-        let script = script.ok_or(InterpreterError::ScriptParse {
-            script_file: script_file.unwrap_or(PathBuf::from("<stdin>")),
-        })?;
-
-        Ok(Self {
-            parser,
-            config,
-            script,
-        })
+        Self::from_script(script_source, script_file, config)
     }
 
-    pub fn run(&mut self, source_file: PathBuf) -> Result<(), InterpreterError> {
-        let source = Rope::from_reader(BufReader::new(
-            File::open(&source_file).map_err(InterpreterError::Io)?,
-        ))
-        .map_err(InterpreterError::Io)?;
-        let cache = FileCache::new(source, source_file);
-
+    fn run_impl(&mut self, cache: FileCache) -> Result<ScriptContext, InterpreterError> {
         let file_tree = parse_source(&mut self.parser, &cache, self.config.log_level, None);
 
         let file_tree = file_tree.ok_or(InterpreterError::TreeParse {
@@ -268,6 +271,17 @@ impl Interpreter {
             }
         }
 
+        Ok(script_ctx)
+    }
+
+    pub fn run(&mut self, source_file: PathBuf) -> Result<(), InterpreterError> {
+        let source = Rope::from_reader(BufReader::new(
+            File::open(&source_file).map_err(InterpreterError::Io)?,
+        ))
+        .map_err(InterpreterError::Io)?;
+
+        let script_ctx = self.run_impl(FileCache::new(source, source_file))?;
+
         if self.config.in_place {
             let mut file =
                 File::create(script_ctx.file_cache.file()).map_err(InterpreterError::Io)?;
@@ -284,5 +298,84 @@ impl Interpreter {
         };
 
         Ok(())
+    }
+}
+
+#[rstest]
+#[case("empty", "", "")]
+#[case(
+    "basic-warn",
+    r#"match ((translation_unit) @t) warn @t "warning";"#,
+    r##"
+    #include <test.h>
+    "##
+)]
+#[case(
+    "include-no-match",
+    r##"match ((preproc_include path: ((_) @str)) @inc (#eq? @str "<test.h>")) where @ contains 
+        (((identifier) @id) (#in-list? @id "TEST" )) insert after @inc "#include <other.h>\n";"##,
+    r##"
+    #include <test.h>
+    "##
+)]
+#[case(
+    "include-match",
+    r##"
+    match ((preproc_include path: ((_) @str)) @inc (#eq? @str "<test.h>")) where @ contains 
+        (((identifier) @id) (#in-list? @id "TEST" )) insert after @inc "#include <other.h>\n";
+    match ((preproc_include path: ((_) @str)) @inc (#eq? @str "<test.h>")) remove @inc;
+    "##,
+    r##"
+    #include <test.h>
+    #define TEST x
+    "##
+)]
+#[case(
+    "include-match-2",
+    r##"
+    match ((preproc_include path: ((_) @str)) @inc (#eq? @str "<test.h>")) where @ contains 
+        (((identifier) @id) (#in-list? @id "TEST" )) insert after @inc "#include <other.h>\n";
+    match ((preproc_include path: ((_) @str)) @inc (#eq? @str "<test.h>")) remove @inc;
+    "##,
+    r##"
+    #include <first.h>
+    #include <test.h>
+    #include <second.h>
+
+    void foo(void) { call(TEST); }
+    "##
+)]
+fn test_interpreter(#[case] test_name: &str, #[case] script: &str, #[case] source: &str) {
+    let source = Rope::from_str(source);
+
+    let mut interpreter = Interpreter::from_script(
+        script.to_string(),
+        Some(PathBuf::new()),
+        InterpreterConfig {
+            language: tree_sitter_c::language(),
+            log_level: LogLevel::None,
+            in_place: true,
+            parse_macros: true,
+        },
+    )
+    .unwrap();
+
+    let result = interpreter.run_impl(FileCache::new(source, PathBuf::new()));
+
+    match result {
+        Ok(ctx) => {
+            insta::with_settings!({ snapshot_suffix => format!("{}-tree", test_name) }, {
+                insta::assert_snapshot!(ctx.file_tree.root_node().to_sexp());
+            });
+
+            insta::with_settings!({ snapshot_suffix => format!("{}-file", test_name) }, {
+                insta::assert_snapshot!(ctx.file_cache.to_string());
+            });
+        }
+        Err(error) => {
+            insta::with_settings!({ snapshot_suffix => format!("{}-error", test_name) }, {
+                insta::assert_debug_snapshot!(error);
+            });
+        }
     }
 }

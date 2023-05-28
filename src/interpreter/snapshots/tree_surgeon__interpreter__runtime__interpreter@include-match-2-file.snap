@@ -1,0 +1,11 @@
+---
+source: src/interpreter/runtime.rs
+expression: ctx.file_cache.to_string()
+---
+
+    #include <first.h>
+    #include <other.h>
+    #include <second.h>
+
+    void foo(void) { call(TEST); }
+    

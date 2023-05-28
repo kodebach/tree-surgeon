@@ -81,6 +81,7 @@ pub trait Executable<Ctx> {
     fn execute(&self, ctx: &mut Ctx) -> Result<ExecutionResult, Self::Error>;
 }
 
+#[derive(Debug)]
 pub struct ScriptContext {
     pub(crate) file_cache: FileCache,
     pub(crate) file_tree: Tree,
