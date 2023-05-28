@@ -89,13 +89,13 @@
             "id": "file",
             "type": "promptString",
             "description": "File Path",
-            "default": "../libelektra/src/plugins/glob/glob.c"
+            "default": "test.c"
         },
         {
             "id": "script_file",
             "type": "promptString",
             "description": "Script Path",
-            "default": "../../uni/msc/paper/scripts/headers_split.tsg"
+            "default": "test.tsg"
         }
     ]
 }

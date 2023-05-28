@@ -288,7 +288,7 @@ impl Executable<ScriptContext> for Match {
             execute_match(
                 self,
                 cache,
-                tree_idx,
+                tree_idx + 1,
                 tree,
                 &query,
                 &mut cursor,

@@ -338,7 +338,7 @@ impl<'a, E: io::Write> Interpreter<'a, E> {
     r#"match ((translation_unit) @t) warn @t "warning";"#,
     r##"
     #include <test.h>
-    "##
+    "##,
 )]
 #[case(
     "include-no-match",
@@ -346,7 +346,7 @@ impl<'a, E: io::Write> Interpreter<'a, E> {
         (((identifier) @id) (#in-list? @id "TEST" )) insert after @inc "#include <other.h>\n";"##,
     r##"
     #include <test.h>
-    "##
+    "##,
 )]
 #[case(
     "include-match",
@@ -358,7 +358,7 @@ impl<'a, E: io::Write> Interpreter<'a, E> {
     r##"
     #include <test.h>
     #define TEST x
-    "##
+    "##,
 )]
 #[case(
     "include-match-2",
@@ -373,7 +373,31 @@ impl<'a, E: io::Write> Interpreter<'a, E> {
     #include <second.h>
 
     void foo(void) { call(TEST); }
-    "##
+    "##,
+)]
+#[case(
+    "replace-foo-bar",
+    r##"
+    match (((type_identifier) @id) (#eq? @id "foo")) replace @id with "bar";
+    "##,
+    r##"
+    void test(void) {
+        foo x;
+    }
+    "##,
+)]
+#[case(
+    "replace-foo-bar-macro",
+    r##"
+    match (((type_identifier) @id) (#eq? @id "foo")) replace @id with "bar";
+    "##,
+    r##"
+    #define do_test do { foo x; } while(0)
+
+    void test(void) {
+        foo x;
+    }
+    "##,
 )]
 fn test_interpreter(#[case] test_name: &str, #[case] script: &str, #[case] source: &str) {
     let _ = miette::set_hook(Box::new(|_| Box::<miette::JSONReportHandler>::default()));
