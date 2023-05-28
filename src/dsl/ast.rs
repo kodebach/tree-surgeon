@@ -29,24 +29,24 @@ impl From<Case> for convert_case::Case {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Script {
     pub statements: Vec<Statement>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Match {
     pub query: Query,
     pub clauses: Vec<MatchClause>,
     pub action: MatchAction,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum MatchClause {
     Where(WhereExpr),
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum WhereExpr {
     Equals(EqualsExpr),
     Contains(ContainsExpr),
@@ -55,34 +55,34 @@ pub enum WhereExpr {
     Not(NotExpr),
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct EqualsExpr {
     pub left: StringExpression,
     pub right: StringExpression,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct AndExpr {
     pub left: Box<WhereExpr>,
     pub right: Box<WhereExpr>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct OrExpr {
     pub left: Box<WhereExpr>,
     pub right: Box<WhereExpr>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct NotExpr(pub Box<WhereExpr>);
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct ContainsExpr {
     pub capture_name: String,
     pub query: Query,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum MatchAction {
     Replace(Replace),
     Warn(Warn),
@@ -90,63 +90,72 @@ pub enum MatchAction {
     Insert(Insert),
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Replace {
     pub capture_name: String,
     pub replacement: StringExpression,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Warn {
     pub capture_name: String,
     pub message: StringExpression,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Remove {
     pub capture_name: String,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InsertLocation {
     Before,
     After,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Insert {
     pub location: InsertLocation,
     pub capture_name: String,
     pub insertion: StringExpression,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum StringExpression {
     Literal(String),
     Join(Vec<JoinItem>),
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum JoinItem {
     CaptureExpr(CaptureExpr),
     Literal(String),
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct CaptureExpr {
     pub capture_name: String,
     pub target_case: Option<Case>,
     pub range: Option<Range<Option<isize>>>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum Statement {
     Match(Match),
     Invalid,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum Query {
-    Query(tree_sitter::Query),
+    Query(tree_sitter::Language, String),
     Invalid,
+}
+
+impl Query {
+    pub fn ts_query(&self) -> Option<tree_sitter::Query> {
+        match self {
+            Query::Query(language, text) => tree_sitter::Query::new(*language, text.as_str()).ok(),
+            Query::Invalid => None,
+        }
+    }
 }

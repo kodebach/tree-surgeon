@@ -13,7 +13,7 @@ use tree_sitter::{InputEdit, Node, Point, QueryCursor, QueryPredicateArg, TextPr
 use crate::{
     dsl::ast::{
         AndExpr, ContainsExpr, EqualsExpr, Insert, InsertLocation, JoinItem, Match, MatchAction,
-        MatchClause, NotExpr, OrExpr, Query, Remove, Replace, Script, Statement, StringExpression,
+        MatchClause, NotExpr, OrExpr, Remove, Replace, Script, Statement, StringExpression,
         Warn, WhereExpr,
     },
     single::Single,
@@ -266,9 +266,7 @@ impl Executable<ScriptContext> for Match {
     type Error = ScriptError;
 
     fn execute(&self, ctx: &mut ScriptContext) -> Result<ExecutionResult, Self::Error> {
-        let Query::Query(query) = &self.query else {
-            return Err(ScriptError::InvalidQuery)
-        };
+        let query = self.query.ts_query().ok_or(ScriptError::InvalidQuery)?;
 
         let mut cursor = QueryCursor::new();
 
@@ -280,13 +278,21 @@ impl Executable<ScriptContext> for Match {
             &ctx.file_cache,
             0,
             &ctx.file_tree,
-            query,
+            &query,
             &mut cursor,
             &mut result,
         )?;
 
         for (tree_idx, (cache, tree)) in ctx.macros.iter().enumerate() {
-            execute_match(self, cache, tree_idx, tree, query, &mut cursor, &mut result)?;
+            execute_match(
+                self,
+                cache,
+                tree_idx,
+                tree,
+                &query,
+                &mut cursor,
+                &mut result,
+            )?;
         }
 
         Ok(result)
@@ -759,12 +765,10 @@ where
                     .ok_or(QueryError::CaptureNotFound(capture_name.clone()))
                     .copied()?;
 
-                let crate::dsl::ast::Query::Query(query) = query else {
-                    return Err(QueryError::InvalidQuery)
-                };
+                let query = query.ts_query().ok_or(QueryError::InvalidQuery)?;
 
                 let contains = 'result: {
-                    for query_match in QueryCursor::new().matches(query, node, ctx.cache) {
+                    for query_match in QueryCursor::new().matches(&query, node, ctx.cache) {
                         if query.evaluate(&mut QueryContext {
                             cache: ctx.cache,
                             query_match: &query_match,

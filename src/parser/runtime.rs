@@ -3,6 +3,7 @@ use chumsky::{
     prelude::*,
 };
 use miette::{miette, LabeledSpan, Report, Severity};
+use rstest::rstest;
 use std::{fmt::Write, marker::PhantomData};
 use tree_sitter::{Language, Query as TsQuery};
 
@@ -304,7 +305,7 @@ where
             let text = &self.source[range];
 
             TsQuery::new(self.language, text)
-                .map(Query::Query)
+                .map(|_| Query::Query(self.language, text.to_string()))
                 .unwrap_or_else(|e| {
                     emitter.emit(Rich::custom(span, format!("malformatted query: {}", e)));
                     Query::Invalid
@@ -534,6 +535,64 @@ impl Parsable for Script {
             (script, reports)
         } else {
             (None, reports)
+        }
+    }
+}
+
+#[rstest]
+#[case(
+    r#"match (translation_unit (declaration declarator: (init_declarator)) @decl) warn @decl "Global variable detected";
+    match (translation_unit (preproc_ifdef (declaration declarator: (init_declarator)) @decl)) warn @decl "Global variable detected";"#,
+    tree_sitter_c::language(),
+    (
+        Some(Script {
+                statements: vec![
+                    Statement::Match(Match {
+                        query: Query::Query(tree_sitter_c::language(), "(translation_unit (declaration declarator: (init_declarator)) @decl)".to_string()),
+                        clauses: vec![],
+                        action: MatchAction::Warn(Warn {
+                            capture_name: "decl".to_string(),
+                            message: StringExpression::Literal("Global variable detected".to_string()),
+                        }),
+                    }),
+                    Statement::Match(Match {
+                        query: Query::Query(tree_sitter_c::language(), "(translation_unit (preproc_ifdef (declaration declarator: (init_declarator)) @decl))".to_string()),
+                        clauses: vec![],
+                        action: MatchAction::Warn(Warn {
+                            capture_name: "decl".to_string(),
+                            message: StringExpression::Literal("Global variable detected".to_string()),
+                        }),
+                    }),
+                ],
+        }),
+        vec![]
+    ),
+)]
+fn test_script(
+    #[case] source: &str,
+    #[case] language: Language,
+    #[case] expected: (Option<Script>, Vec<Report>),
+) {
+    let (expected_script, expected_reports) = expected;
+    let (actual_script, actual_reports) = Script::parse(source, language);
+
+    similar_asserts::assert_eq!(actual_script, expected_script);
+    assert_eq!(actual_reports.len(), expected_reports.len());
+}
+
+#[allow(unused_imports)]
+mod proptests {
+    use proptest::prelude::*;
+
+    use crate::{
+        dsl::ast::Script,
+        parser::{lexer::Token, Parsable},
+    };
+
+    proptest! {
+        #[test]
+        fn doesnt_crash(source in ".*") {
+            Script::parse(source.as_str(), tree_sitter_c::language());
         }
     }
 }
