@@ -1,37 +1,37 @@
 use std::path::PathBuf;
 
-use clap::{ArgAction, Parser};
+use clap::{ArgAction, Parser, command};
 
 use tree_surgeon::interpreter::{self, Interpreter, InterpreterConfig};
 
 #[derive(clap::Parser, Debug)]
-#[clap(author, version, about, long_about=None)]
+#[command(author, version, about, long_about=None)]
 struct Cli {
     /// source file to edit
-    #[clap(value_parser)]
+    #[arg()]
     source_file: PathBuf,
 
     /// script to execute, if missing use stdin
-    #[clap(value_parser)]
+    #[arg()]
     script_file: Option<PathBuf>,
 
     /// amount of information to print
-    #[clap(arg_enum, short, long, default_value_t = LogLevel::Warning)]
+    #[arg(value_enum, short, long, default_value_t = LogLevel::Warning)]
     log_level: LogLevel,
 
     /// write output to the input source file
-    #[clap(short, long)]
+    #[arg(short, long)]
     in_place: bool,
 
     /// search in macros
-    #[clap(long, action = ArgAction::Set, default_value_t = true)]
+    #[arg(long, action = ArgAction::Set, default_value_t = true)]
     parse_macros: bool,
 
-    #[clap(arg_enum, long, default_value_t = Language::C)]
+    #[arg(value_enum, long, default_value_t = Language::C)]
     language: Language,
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, clap::ArgEnum)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, clap::ValueEnum)]
 enum LogLevel {
     Advice,
     Warning,
@@ -50,7 +50,7 @@ impl LogLevel {
     }
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, clap::ArgEnum)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, clap::ValueEnum)]
 enum Language {
     C,
 }

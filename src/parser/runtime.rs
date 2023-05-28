@@ -2,8 +2,7 @@ use chumsky::{
     input::{SliceInput, ValueInput},
     prelude::*,
 };
-use logos::Logos;
-use miette::{LabeledSpan, Severity, Report};
+use miette::{miette, LabeledSpan, Report, Severity};
 use std::{fmt::Write, marker::PhantomData};
 use tree_sitter::{Language, Query as TsQuery};
 
@@ -480,17 +479,23 @@ impl Parsable for Script {
             marker: Default::default(),
         };
 
-        let tokens = Token::lexer(source)
-            .spanned()
-            .filter(|(token, _)| !matches!(token, Token::Comment))
-            .map(|(tok, span)| (tok, SimpleSpan::from(span)))
-            .collect::<Vec<_>>();
+        let mut reports = vec![];
 
-        if false {
-            for (token, span) in tokens.iter() {
-                eprintln!("{}: {:?}", span, token);
-            }
-        }
+        let tokens: Vec<_> = run_lexer(source)
+            .into_iter()
+            .filter_map(|(result, span)| match result {
+                Ok(token) => Some((token, span)),
+                Result::Err(e) => {
+                    reports.push(miette!(
+                        severity = Severity::Error,
+                        code = "tree_surgeon::dsl::lexer",
+                        "{}",
+                        e
+                    ));
+                    None
+                }
+            })
+            .collect();
 
         let eoi = SimpleSpan::new(source.len(), source.len());
 
@@ -498,7 +503,7 @@ impl Parsable for Script {
 
         let (script, parse_errs) = parser.script().parse(token_input).into_output_errors();
 
-        let reports: Vec<_> = parse_errs
+        let parse_reports = parse_errs
             .into_iter()
             .map(|e| {
                 e.map_token(|tok| {
@@ -511,7 +516,7 @@ impl Parsable for Script {
             .map(|e| {
                 let span = e.span();
 
-                miette::miette!(
+                miette!(
                     severity = Severity::Error,
                     code = "tree_surgeon::dsl::parse",
                     labels = [LabeledSpan::new(
@@ -522,8 +527,8 @@ impl Parsable for Script {
                     "{}",
                     e,
                 )
-            })
-            .collect();
+            });
+        reports.extend(parse_reports);
 
         if reports.is_empty() {
             (script, reports)

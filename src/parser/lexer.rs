@@ -1,6 +1,17 @@
+use chumsky::{span::SimpleSpan};
 use logos::{Lexer, Logos};
 
+#[derive(Debug, PartialEq, Clone, Default, thiserror::Error)]
+pub enum TokenError {
+    #[error("invalid string")]
+    InvalidString(#[from] StringError),
+    #[default]
+    #[error("unknown error")]
+    Other,
+}
+
 #[derive(Logos, Debug, Clone, PartialEq)]
+#[logos(skip r"\s+", error = TokenError)]
 pub enum Token<'a> {
     #[regex(r"-?[[:digit:]]+(\.[[:digit:]]+)?([eE][+-]?[[:digit:]]+)?", priority = 2, callback = |lex| lex.slice())]
     Number(&'a str),
@@ -82,26 +93,36 @@ pub enum Token<'a> {
 
     #[regex(r"--.*\r?\n", logos::skip)]
     Comment,
-
-    #[error]
-    #[regex(r"\s+", logos::skip)]
-    Error,
 }
 
-fn parse_string<'a>(lexer: &mut Lexer<'a, Token<'a>>) -> Option<String> {
+fn parse_string<'a>(lexer: &mut Lexer<'a, Token<'a>>) -> Result<String, TokenError> {
     let s = lexer.slice();
     StringToken::lexer(&s[1..s.len() - 1])
-        .map(|t| match t {
-            StringToken::Escape(c) => Ok(c),
-            StringToken::Unicode(c) => Ok(c),
-            StringToken::Other(c) => Ok(c),
-            StringToken::Error => Err(Token::ERROR),
+        .map(|result| {
+            result
+                .map(|t| match t {
+                    StringToken::Escape(c) => c,
+                    StringToken::Unicode(c) => c,
+                    StringToken::Other(c) => c,
+                })
+                .map_err(TokenError::InvalidString)
         })
         .collect::<Result<String, _>>()
-        .ok()
+}
+
+#[derive(Debug, PartialEq, Clone, Default, thiserror::Error)]
+pub enum StringError {
+    #[error("invalid escape sequence '\\{0}'")]
+    InvalidEscape(char),
+    #[error("invalid unicode codepoint '\\u{0:#04x}'")]
+    InvalidUnicode(u32),
+    #[default]
+    #[error("unknown error")]
+    Other,
 }
 
 #[derive(Logos, Debug)]
+#[logos(error = StringError)]
 enum StringToken {
     #[regex(r#"\\[bfnrt\\/"]"#, parse_escape)]
     Escape(char),
@@ -112,27 +133,37 @@ enum StringToken {
     Unicode(char),
     #[regex(r#"[^"\\]"#, |lex| lex.slice().chars().next())]
     Other(char),
-
-    #[error]
-    Error,
 }
 
-fn parse_escape(lexer: &mut Lexer<StringToken>) -> Option<char> {
-    lexer.slice().chars().nth(1).and_then(|c| match c {
-        'b' => Some('\x08'),
-        'f' => Some('\x0C'),
-        'n' => Some('\n'),
-        'r' => Some('\r'),
-        't' => Some('\t'),
-        '"' => Some('\"'),
-        '\\' => Some('\\'),
-        '/' => Some('/'),
-        _ => None,
-    })
+fn parse_escape(lexer: &mut Lexer<StringToken>) -> Result<char, StringError> {
+    match lexer.slice().chars().nth(1).unwrap() {
+        'b' => Ok('\x08'),
+        'f' => Ok('\x0C'),
+        'n' => Ok('\n'),
+        'r' => Ok('\r'),
+        't' => Ok('\t'),
+        '"' => Ok('\"'),
+        '\\' => Ok('\\'),
+        '/' => Ok('/'),
+        c => Err(StringError::InvalidEscape(c)),
+    }
 }
 
-fn parse_unicode(lexer: &mut Lexer<StringToken>) -> Option<char> {
-    u32::from_str_radix(&lexer.slice()[2..], 16)
-        .ok()
-        .and_then(char::from_u32)
+fn parse_unicode(lexer: &mut Lexer<StringToken>) -> Result<char, StringError> {
+    let codepoint = u32::from_str_radix(&lexer.slice()[2..], 16).unwrap();
+    char::from_u32(codepoint).ok_or(StringError::InvalidUnicode(codepoint))
+}
+
+type SpannedLexerResult<'a> = Vec<(Result<Token<'a>, TokenError>, SimpleSpan)>;
+
+fn run_lexer_impl(source: &str, filter_comments: bool) -> SpannedLexerResult {
+    Token::lexer(source)
+        .spanned()
+        .filter(|(result, _)| !filter_comments || !matches!(result, Ok(Token::Comment)))
+        .map(|(result, span)| (result, SimpleSpan::from(span)))
+        .collect::<Vec<_>>()
+}
+
+pub fn run_lexer(source: &str) -> SpannedLexerResult {
+    run_lexer_impl(source, true)
 }

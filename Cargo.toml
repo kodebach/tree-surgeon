@@ -14,17 +14,19 @@ name = "tree-surgeon"
 path = "src/main.rs"
 
 [dependencies]
-anyhow = "1.0.57"
-chumsky = { version = "1.0.0-alpha.3", features = ["label"] }
-clap = { version = "3.2.2", features = ["derive"] }
+anyhow = "1.0.71"
+chumsky = { version = "1.0.0-alpha.4", features = ["label"] }
+clap = { version = "4.3.0", features = ["derive", "help", "usage", "error-context", "wrap_help"] }
 convert_case = "0.6.0"
 derive_more = "0.99.17"
-is-terminal = "0.4.4"
+is-terminal = "0.4.7"
 lazycell = "1.3.0"
-logos = "0.12.1"
+logos = "0.13.0"
 miette = { version = "5.9.0", features = ["fancy"] }
+proptest = "1.2.0"
 ropey = "1.6.0"
+rstest = "0.17.0"
 strum = { version = "0.24.1", features = ["derive"] }
-thiserror = "1.0.31"
-tree-sitter = "0.20.6"
+thiserror = "1.0.40"
+tree-sitter = "0.20.10"
 tree-sitter-c = "0.20.2"
