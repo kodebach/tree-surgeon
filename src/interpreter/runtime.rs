@@ -1,7 +1,8 @@
 use std::{
     fs::File,
     io::{self, BufReader, Read},
-    path::PathBuf, vec,
+    path::PathBuf,
+    vec,
 };
 
 use miette::{miette, LabeledSpan, Severity};
@@ -414,22 +415,17 @@ impl<'a, E: io::Write> Interpreter<'a, E> {
     "##,
     true
 )]
-fn test_interpreter(
+fn test_interpreter_c(
     #[case] test_name: &str,
     #[case] script: &str,
     #[case] source: &str,
     #[case] parse_macros: bool,
-) {
-    let _ = miette::set_hook(Box::new(|_| Box::<miette::JSONReportHandler>::default()));
-
-    let source = Rope::from_str(source);
-
-    let mut output = Vec::default();
-
-    let mut interpreter = Interpreter::from_script(
+) -> anyhow::Result<()> {
+    test_interpreter(
+        "c",
+        test_name,
+        Rope::from_str(source),
         script.to_string(),
-        Some(PathBuf::new()),
-        &mut output,
         InterpreterConfig {
             language: tree_sitter_c::language(),
             log_level: LogLevel::None,
@@ -437,12 +433,35 @@ fn test_interpreter(
             parse_macros,
         },
     )
-    .unwrap();
+}
 
-    let result = interpreter.run_impl(FileCache::new(source, PathBuf::new()));
+#[allow(dead_code)] // used via rstest
+fn test_interpreter(
+    prefix: &str,
+    test_name: &str,
+    source: Rope,
+    script: String,
+    config: InterpreterConfig,
+) -> anyhow::Result<()> {
+    let test_name = format!("{}-{}", prefix, test_name);
+
+    let _ = miette::set_hook(Box::new(|_| Box::<miette::JSONReportHandler>::default()));
+
+    let mut output = Vec::default();
+
+    let interpreter = Interpreter::from_script(script, Some(PathBuf::new()), &mut output, config);
+
+    let result = match interpreter {
+        Ok(mut interpreter) => interpreter.run_impl(FileCache::new(source, PathBuf::new())),
+        Err(err) => Err(err),
+    };
+
+    let output_text = String::from_utf8(output)?;
+
+    println!("{}", output_text);
 
     insta::with_settings!({ snapshot_suffix => format!("{}-output", test_name) }, {
-        insta::assert_snapshot!(String::from_utf8(output).unwrap());
+        insta::assert_snapshot!(output_text);
     });
 
     match result {
@@ -459,10 +478,10 @@ fn test_interpreter(
                 insta::with_settings!({ snapshot_suffix => format!("{}-macro_tree_{}", test_name, idx) }, {
                     insta::assert_snapshot!(tree.root_node().to_sexp());
                 });
-    
+
                 insta::with_settings!({ snapshot_suffix => format!("{}-macro_{}", test_name, idx) }, {
                     insta::assert_snapshot!(cache.to_string());
-                });    
+                });
             }
         }
         Err(error) => {
@@ -471,4 +490,6 @@ fn test_interpreter(
             });
         }
     }
+
+    Ok(())
 }

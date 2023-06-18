@@ -1,5 +1,5 @@
 ---
 source: src/interpreter/runtime.rs
-expression: "String::from_utf8(output).unwrap()"
+expression: output_text
 ---
 {"message": "warning","severity": "warning","causes": [],"filename": "","labels": [{"span": {"offset": 5,"length": 22}}],"related": []}
