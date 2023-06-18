@@ -57,9 +57,13 @@ impl ExecutionResult {
     fn combine(&mut self, other: Self) {
         for other in other.edits {
             let overlap = self.edits.iter().any(|e| {
+                e.edit.start_byte != e.edit.old_end_byte
+            });
+            // FIXME: multiple edits without reparsing?
+            /*let overlap = self.edits.iter().any(|e| {
                 e.edit.start_byte < other.edit.old_end_byte
                     && other.edit.start_byte < e.edit.old_end_byte
-            });
+            });*/
 
             if !overlap {
                 self.edits.push(other);

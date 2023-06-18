@@ -294,19 +294,19 @@ impl<'a, E: io::Write> Interpreter<'a, E> {
 
             for edit in edits {
                 edit.apply(&mut script_ctx);
-
-                let new_tree = parse_source(
-                    &mut self.parser,
-                    &script_ctx.file_cache,
-                    self.config.log_level,
-                    Some(&script_ctx.file_tree),
-                    &mut self.output,
-                )?;
-
-                script_ctx.file_tree = new_tree.ok_or(InterpreterError::TreeParse {
-                    source_file: script_ctx.file_cache.file().to_owned(),
-                })?;
             }
+
+            let new_tree = parse_source(
+                &mut self.parser,
+                &script_ctx.file_cache,
+                self.config.log_level,
+                Some(&script_ctx.file_tree),
+                &mut self.output,
+            )?;
+
+            script_ctx.file_tree = new_tree.ok_or(InterpreterError::TreeParse {
+                source_file: script_ctx.file_cache.file().to_owned(),
+            })?;
         }
 
         Ok(script_ctx)
@@ -411,6 +411,42 @@ impl<'a, E: io::Write> Interpreter<'a, E> {
 
     void test(void) {
         foo x;
+    }
+    "##,
+    true
+)]
+#[case(
+    "replace-multiple",
+    r##"
+    match (((identifier) @id) (#in-list? @id "kdbClose" "kdbGet" "kdbOpen" "kdbSet")) replace @id by ["elektra" @id$UpperCamel];
+    "##,
+    r##"
+    int main (void)
+    {
+        fprintf (stdout, "%s;%s;%s\n", "plugin", "operation", "microseconds");
+        timeInit ();
+    
+        Key * parentKey = keyNew ("user:/benchmark", KEY_END);
+        KDB * handle = kdbOpen (NULL, parentKey);
+        fprintf (stdout, CSV_STR_FMT, "core", "kdbOpen", timeGetDiffMicroseconds ());
+    
+        KeySet * returned = ksNew (0, KS_END);
+        timeInit ();
+        kdbGet (handle, returned, parentKey);
+        fprintf (stdout, CSV_STR_FMT, "core", "kdbGet", timeGetDiffMicroseconds ());
+    
+        if (ksGetSize (returned) == 0)
+        {
+            fprintf (stderr, "error: no keys returned. make sure you actually have something in %s!", keyName (parentKey));
+            goto error;
+        }
+    
+    error:
+        kdbClose (handle, parentKey);
+        ksDel (returned);
+        keyDel (parentKey);
+    
+        benchmarkDel ();
     }
     "##,
     true
