@@ -1,7 +1,7 @@
 use std::{
     fs::File,
     io::{self, BufReader, Read},
-    path::PathBuf,
+    path::PathBuf, vec,
 };
 
 use miette::{miette, LabeledSpan, Severity};
@@ -256,14 +256,18 @@ impl<'a, E: io::Write> Interpreter<'a, E> {
         };
 
         loop {
-            let macros = parse_macros(
-                &script_ctx.file_tree,
-                &script_ctx.file_cache,
-                &mut self.parser,
-                self.config.log_level,
-                self.config.language,
-                &mut self.output,
-            );
+            let macros = if self.config.parse_macros {
+                parse_macros(
+                    &script_ctx.file_tree,
+                    &script_ctx.file_cache,
+                    &mut self.parser,
+                    self.config.log_level,
+                    self.config.language,
+                    &mut self.output,
+                )
+            } else {
+                vec![]
+            };
             script_ctx.macros = macros;
 
             let ExecutionResult { edits, reports } = self
@@ -332,13 +336,14 @@ impl<'a, E: io::Write> Interpreter<'a, E> {
 }
 
 #[rstest]
-#[case("empty", "", "")]
+#[case("empty", "", "", false)]
 #[case(
     "basic-warn",
     r#"match ((translation_unit) @t) warn @t "warning";"#,
     r##"
     #include <test.h>
     "##,
+    false
 )]
 #[case(
     "include-no-match",
@@ -347,6 +352,7 @@ impl<'a, E: io::Write> Interpreter<'a, E> {
     r##"
     #include <test.h>
     "##,
+    false
 )]
 #[case(
     "include-match",
@@ -359,6 +365,7 @@ impl<'a, E: io::Write> Interpreter<'a, E> {
     #include <test.h>
     #define TEST x
     "##,
+    false
 )]
 #[case(
     "include-match-2",
@@ -374,6 +381,7 @@ impl<'a, E: io::Write> Interpreter<'a, E> {
 
     void foo(void) { call(TEST); }
     "##,
+    false
 )]
 #[case(
     "replace-foo-bar",
@@ -381,10 +389,13 @@ impl<'a, E: io::Write> Interpreter<'a, E> {
     match (((type_identifier) @id) (#eq? @id "foo")) replace @id with "bar";
     "##,
     r##"
+    #define do_test do { foo x; } while(0)
+
     void test(void) {
         foo x;
     }
     "##,
+    false
 )]
 #[case(
     "replace-foo-bar-macro",
@@ -398,8 +409,14 @@ impl<'a, E: io::Write> Interpreter<'a, E> {
         foo x;
     }
     "##,
+    true
 )]
-fn test_interpreter(#[case] test_name: &str, #[case] script: &str, #[case] source: &str) {
+fn test_interpreter(
+    #[case] test_name: &str,
+    #[case] script: &str,
+    #[case] source: &str,
+    #[case] parse_macros: bool,
+) {
     let _ = miette::set_hook(Box::new(|_| Box::<miette::JSONReportHandler>::default()));
 
     let source = Rope::from_str(source);
@@ -414,7 +431,7 @@ fn test_interpreter(#[case] test_name: &str, #[case] script: &str, #[case] sourc
             language: tree_sitter_c::language(),
             log_level: LogLevel::None,
             in_place: true,
-            parse_macros: true,
+            parse_macros,
         },
     )
     .unwrap();

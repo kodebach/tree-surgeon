@@ -3,6 +3,8 @@ source: src/interpreter/runtime.rs
 expression: ctx.file_cache.to_string()
 ---
 
+    #define do_test do { foo x; } while(0)
+
     void test(void) {
         bar x;
     }
