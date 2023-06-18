@@ -4,14 +4,11 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use miette::SourceSpan;
 use ropey::{Rope, RopeSlice};
 use tree_sitter::Node;
 
 pub trait SourceCache: Debug + ToString {
     fn file(&self) -> &Path;
-
-    fn translate_span(&self, span: SourceSpan) -> SourceSpan;
 
     fn get_node_string(&self, node: Node) -> String;
 
@@ -19,7 +16,7 @@ pub trait SourceCache: Debug + ToString {
         &self,
         parser: &mut tree_sitter::Parser,
         old_tree: Option<&tree_sitter::Tree>,
-    ) -> Option<tree_sitter::Tree>;
+    ) -> Result<Option<tree_sitter::Tree>, tree_sitter::IncludedRangesError>;
 
     fn write_to(&self, target: &mut impl std::io::Write) -> std::io::Result<()>;
 }
@@ -86,10 +83,6 @@ impl SourceCache for FileCache {
         &self.file
     }
 
-    fn translate_span(&self, span: SourceSpan) -> SourceSpan {
-        span
-    }
-
     fn get_node_string(&self, node: Node) -> String {
         self.rope.byte_slice(node.byte_range()).to_string()
     }
@@ -98,12 +91,14 @@ impl SourceCache for FileCache {
         &self,
         parser: &mut tree_sitter::Parser,
         old_tree: Option<&tree_sitter::Tree>,
-    ) -> Option<tree_sitter::Tree> {
+    ) -> Result<Option<tree_sitter::Tree>, tree_sitter::IncludedRangesError> {
+        parser.set_included_ranges(&[])?;
         let mut callback = |offset, _| {
             let (chunk, chunk_byte_index, _, _) = self.rope.chunk_at_byte(offset);
             &chunk[(offset - chunk_byte_index)..]
         };
-        parser.parse_with(&mut callback, old_tree)
+        let tree = parser.parse_with(&mut callback, old_tree);
+        Ok(tree)
     }
 
     fn write_to(&self, target: &mut impl std::io::Write) -> std::io::Result<()> {
@@ -121,39 +116,30 @@ impl ToString for FileCache {
 pub struct MacroCache {
     file: PathBuf,
     rope: Rope,
-    range: Range<usize>,
+    range: tree_sitter::Range,
 }
 
 impl MacroCache {
-    pub fn new(file_cache: &FileCache, range: Range<usize>) -> Self {
+    pub fn new(file_cache: &FileCache, range: tree_sitter::Range) -> Self {
         let rope = file_cache.rope.clone();
-        let start_line = rope.byte_to_line(range.start);
-        let end_line = rope.byte_to_line(range.end);
-
-        let start_col = rope.byte_to_char(range.start) - rope.line_to_char(start_line);
-        let end_col = rope.byte_to_char(range.end) - rope.line_to_char(end_line);
 
         MacroCache {
             file: PathBuf::from(format!(
                 "{}@{}:{}-{}:{}",
                 file_cache.file.to_string_lossy(),
-                start_line,
-                start_col,
-                end_line,
-                end_col
+                range.start_point.row,
+                range.start_point.column,
+                range.end_point.row,
+                range.end_point.column,
             )),
             rope,
             range,
         }
     }
 
-    pub fn translate_range(&self, range: Range<usize>) -> Range<usize> {
-        let offset = self.range.start;
-        range.start + offset..range.end + offset
-    }
-
     fn rope_slice(&self) -> RopeSlice {
-        self.rope.byte_slice(self.range.clone())
+        self.rope
+            .byte_slice(self.range.start_byte..self.range.end_byte)
     }
 }
 
@@ -162,24 +148,23 @@ impl SourceCache for MacroCache {
         &self.file
     }
 
-    fn translate_span(&self, span: SourceSpan) -> SourceSpan {
-        SourceSpan::new((span.offset() + self.range.start).into(), span.len().into())
-    }
-
     fn get_node_string(&self, node: Node) -> String {
-        self.rope_slice().byte_slice(node.byte_range()).to_string()
+        self.rope.byte_slice(node.byte_range()).to_string()
     }
 
     fn parse(
         &self,
         parser: &mut tree_sitter::Parser,
         old_tree: Option<&tree_sitter::Tree>,
-    ) -> Option<tree_sitter::Tree> {
+    ) -> Result<Option<tree_sitter::Tree>, tree_sitter::IncludedRangesError> {
+        parser.set_included_ranges(&[self.range])?;
         let mut callback = |offset, _| {
-            let (chunk, chunk_byte_index, _, _) = self.rope_slice().chunk_at_byte(offset);
+            let (chunk, chunk_byte_index, _, _) = self.rope.chunk_at_byte(offset);
             &chunk[(offset - chunk_byte_index)..]
         };
-        parser.parse_with(&mut callback, old_tree)
+        let tree = parser.parse_with(&mut callback, old_tree);
+        parser.set_included_ranges(&[])?;
+        Ok(tree)
     }
 
     fn write_to(&self, target: &mut impl std::io::Write) -> std::io::Result<()> {
@@ -201,7 +186,7 @@ impl<'a> tree_sitter::TextProvider<'a> for &'a MacroCache {
     type I = Chunks<'a>;
 
     fn text(&mut self, node: Node) -> Self::I {
-        let chunks = self.rope_slice().byte_slice(node.byte_range()).chunks();
+        let chunks = self.rope.byte_slice(node.byte_range()).chunks();
         Chunks { chunks }
     }
 }

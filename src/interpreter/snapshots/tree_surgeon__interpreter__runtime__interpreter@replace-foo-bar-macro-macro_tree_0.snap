@@ -1,0 +1,5 @@
+---
+source: src/interpreter/runtime.rs
+expression: tree.root_node().to_sexp()
+---
+(translation_unit (do_statement body: (compound_statement (declaration type: (type_identifier) declarator: (identifier))) condition: (parenthesized_expression (number_literal)) (MISSING ";")))

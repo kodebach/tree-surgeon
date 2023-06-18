@@ -23,14 +23,14 @@ fn parse_source<C, E>(
     log_level: LogLevel,
     old_tree: Option<&Tree>,
     output: &mut E,
-) -> Option<Tree>
+) -> Result<Option<Tree>, tree_sitter::IncludedRangesError>
 where
     C: SourceCache,
     E: io::Write,
 {
-    let tree = cache.parse(parser, old_tree);
+    let tree = cache.parse(parser, old_tree)?;
 
-    if let Some(tree) = tree {
+    let tree = if let Some(tree) = tree {
         let mut reports: Vec<_> = if log_level <= LogLevel::Advice {
             let cursor = tree.walk();
             let error_iter = cursor.error_iter();
@@ -39,14 +39,11 @@ where
                 .map(|node| {
                     let parent = node.parent().unwrap_or(node);
 
-                    let node_span = cache.translate_span(node.byte_range().into());
-                    let parent_span = cache.translate_span(parent.byte_range().into());
-
                     miette!(
                         severity = Severity::Advice,
                         labels = [
-                            LabeledSpan::new_with_span(Some(parent.to_sexp()), parent_span),
-                            LabeledSpan::new_with_span(Some(node.to_sexp()), node_span),
+                            LabeledSpan::new_with_span(Some(parent.to_sexp()), parent.byte_range()),
+                            LabeledSpan::new_with_span(Some(node.to_sexp()), node.byte_range()),
                         ],
                         "tree-sitter couldn't parse code fragment"
                     )
@@ -89,7 +86,9 @@ where
         None
     } else {
         None
-    }
+    };
+
+    Ok(tree)
 }
 
 fn parse_macros<E>(
@@ -99,7 +98,7 @@ fn parse_macros<E>(
     log_level: LogLevel,
     language: tree_sitter::Language,
     output: &mut E,
-) -> Vec<(MacroCache, Tree)>
+) -> Result<Vec<(MacroCache, Tree)>, tree_sitter::IncludedRangesError>
 where
     E: io::Write,
 {
@@ -121,16 +120,16 @@ where
             .single()
             .expect("macro_query broken (get)");
 
-        let macro_cache = MacroCache::new(cache, node.byte_range());
+        let macro_cache = MacroCache::new(cache, node.range());
 
-        let tree = parse_source(parser, &macro_cache, log_level, None, output);
+        let tree = parse_source(parser, &macro_cache, log_level, None, output)?;
 
         if let Some(tree) = tree {
             results.push((macro_cache, tree));
         }
     }
 
-    results
+    Ok(results)
 }
 
 pub struct Interpreter<'a, E: io::Write> {
@@ -160,6 +159,10 @@ pub enum InterpreterError {
     #[error("tree-sitter couldn't parse the file {source_file}")]
     #[diagnostic(code(tree_surgeon::tree_sitter::parse_error))]
     TreeParse { source_file: PathBuf },
+
+    #[error(transparent)]
+    #[diagnostic(code(tree_surgeon::tree_sitter::included_range))]
+    IncludedRange(#[from] tree_sitter::IncludedRangesError),
 
     #[error("couldn't parse the script {script_file}")]
     #[diagnostic(code(tree_surgeon::script::parse_error))]
@@ -243,7 +246,7 @@ impl<'a, E: io::Write> Interpreter<'a, E> {
             self.config.log_level,
             None,
             &mut self.output,
-        );
+        )?;
 
         let file_tree = file_tree.ok_or(InterpreterError::TreeParse {
             source_file: cache.file().to_owned(),
@@ -264,7 +267,7 @@ impl<'a, E: io::Write> Interpreter<'a, E> {
                     self.config.log_level,
                     self.config.language,
                     &mut self.output,
-                )
+                )?
             } else {
                 vec![]
             };
@@ -297,7 +300,7 @@ impl<'a, E: io::Write> Interpreter<'a, E> {
                     self.config.log_level,
                     Some(&script_ctx.file_tree),
                     &mut self.output,
-                );
+                )?;
 
                 script_ctx.file_tree = new_tree.ok_or(InterpreterError::TreeParse {
                     source_file: script_ctx.file_cache.file().to_owned(),
@@ -444,13 +447,23 @@ fn test_interpreter(
 
     match result {
         Ok(ctx) => {
-            insta::with_settings!({ snapshot_suffix => format!("{}-tree", test_name) }, {
+            insta::with_settings!({ snapshot_suffix => format!("{}-file_tree", test_name) }, {
                 insta::assert_snapshot!(ctx.file_tree.root_node().to_sexp());
             });
 
             insta::with_settings!({ snapshot_suffix => format!("{}-file", test_name) }, {
                 insta::assert_snapshot!(ctx.file_cache.to_string());
             });
+
+            for (idx, (cache, tree)) in ctx.macros.iter().enumerate() {
+                insta::with_settings!({ snapshot_suffix => format!("{}-macro_tree_{}", test_name, idx) }, {
+                    insta::assert_snapshot!(tree.root_node().to_sexp());
+                });
+    
+                insta::with_settings!({ snapshot_suffix => format!("{}-macro_{}", test_name, idx) }, {
+                    insta::assert_snapshot!(cache.to_string());
+                });    
+            }
         }
         Err(error) => {
             insta::with_settings!({ snapshot_suffix => format!("{}-error", test_name) }, {

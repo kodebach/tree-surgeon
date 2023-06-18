@@ -13,8 +13,8 @@ use tree_sitter::{InputEdit, Node, Point, QueryCursor, QueryPredicateArg, TextPr
 use crate::{
     dsl::ast::{
         AndExpr, ContainsExpr, EqualsExpr, Insert, InsertLocation, JoinItem, Match, MatchAction,
-        MatchClause, NotExpr, OrExpr, Remove, Replace, Script, Statement, StringExpression,
-        Warn, WhereExpr,
+        MatchClause, NotExpr, OrExpr, Remove, Replace, Script, Statement, StringExpression, Warn,
+        WhereExpr,
     },
     single::Single,
 };
@@ -35,11 +35,6 @@ pub struct TreeEdit {
 impl TreeEdit {
     pub fn apply(&self, ctx: &mut ScriptContext) {
         let edit_range = self.edit.start_byte..self.edit.old_end_byte;
-        let edit_range = if self.tree_idx == 0 {
-            edit_range
-        } else {
-            ctx.macros[self.tree_idx - 1].0.translate_range(edit_range)
-        };
         ctx.file_cache
             .apply_edit(edit_range, self.new_text.as_str());
 
@@ -138,16 +133,11 @@ pub struct EditInErrorNodeError {
 }
 
 impl EditInErrorNodeError {
-    fn new(
-        error_label: String,
-        error_span: SourceSpan,
-        edit_span: SourceSpan,
-        cache: &impl SourceCache,
-    ) -> Self {
+    fn new(error_label: String, error_span: SourceSpan, edit_span: SourceSpan) -> Self {
         EditInErrorNodeError {
             error_label,
-            error_span: cache.translate_span(error_span),
-            edit_span: cache.translate_span(edit_span),
+            error_span,
+            edit_span,
         }
     }
 }
@@ -328,7 +318,6 @@ where
                 error.to_sexp(),
                 (error_start_byte, error_end_byte - error_start_byte).into(),
                 (start_byte, old_end_byte - start_byte).into(),
-                ctx.cache,
             )));
         }
 
@@ -378,10 +367,7 @@ where
 
         let report = miette::miette!(
             severity = Severity::Warning,
-            labels = [LabeledSpan::new_with_span(
-                None,
-                ctx.cache.translate_span(node.byte_range().into()),
-            )],
+            labels = [LabeledSpan::new_with_span(None, node.byte_range(),)],
             "{}",
             msg,
         );
@@ -421,7 +407,6 @@ where
                 error.to_sexp(),
                 (error_start_byte, error_end_byte - error_start_byte).into(),
                 (start_byte, old_end_byte - start_byte).into(),
-                ctx.cache,
             )));
         }
 
@@ -477,7 +462,6 @@ where
                 error.to_sexp(),
                 (error_start_byte, error_end_byte - error_start_byte).into(),
                 (start_byte, old_end_byte - start_byte).into(),
-                ctx.cache,
             )));
         }
 

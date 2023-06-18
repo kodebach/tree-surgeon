@@ -1,0 +1,5 @@
+---
+source: src/interpreter/runtime.rs
+expression: cache.to_string()
+---
+ do { bar x; } while(0)
